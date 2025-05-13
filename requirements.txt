@@ -1,0 +1,10 @@
+pandas
+matplotlib
+statsmodels
+scikit-learn
+numpy
+seaborn
+tqdm
+jupyter
+notebook
+optuna
