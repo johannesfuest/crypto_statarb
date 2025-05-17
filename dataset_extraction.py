@@ -134,7 +134,7 @@ def main(start_ym: str, end_ym: str, coins: list[str], dest: Path) -> None:
                 csv_path,
                 header=0 if hdr else None,
                 names=None if hdr else FUND_COLS,
-                usecols=[0, 1],      # ignore the trailing “symbol” column if present
+                usecols=[0, 1, 2],      # ignore the trailing “symbol” column if present
             )
 
         df["coin"] = coin

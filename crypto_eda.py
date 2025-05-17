@@ -1,10 +1,9 @@
-#%%
+# %%
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-
-#%% load the data for January 2022
+# %% load the data for January 2022
 base_dir = "/share/data/jfuest_crypto/test/"
 
 coins = ["BTC", "ETH", "BNB", "SOL", "DOGE"]
