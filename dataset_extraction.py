@@ -89,7 +89,7 @@ def main(start_ym: str, end_ym: str, coins: list[str], dest: Path) -> None:
     # -------- copy + unzip -------------------------------------------------- #
     dest.mkdir(parents=True, exist_ok=True)
     raw_dir = dest / "_raw"           # temporary extraction directory
-    raw_dir.mkdir()
+    raw_dir.mkdir(exist_ok=True)
 
     for coin in coins:
         for ym in months:
@@ -117,7 +117,7 @@ def main(start_ym: str, end_ym: str, coins: list[str], dest: Path) -> None:
 
         m = (PRICE_CSV_RE if is_price else FUND_CSV_RE).match(name)
         if not m:
-            raise ValueError(f"Un‑recognised file name: {name}")
+            raise ValueError(f"Un-recognised file name: {name}")
         coin = m["coin"]
 
         with csv_path.open("r") as fh:
