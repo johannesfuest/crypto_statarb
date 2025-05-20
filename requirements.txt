@@ -5,6 +5,13 @@ scikit-learn
 numpy
 seaborn
 tqdm
-jupyter
 notebook
 optuna
+arch @ git+https://github.com/bashtage/arch.git@v7.2.0
+plotly>=6.0.1
+jupyter
+ipykernel
+jupyterlab
+ipypublish
+petname
+quantstats-lumi @ git+https://github.com/Lumiwealth/quantstats_lumi@097f85f
