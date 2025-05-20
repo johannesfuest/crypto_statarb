@@ -1,2 +1,4 @@
 mse_244/*
 .vscode/*
+*.csv
+.DS_Store
