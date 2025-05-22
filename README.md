@@ -6,6 +6,7 @@ Simple implementation of pairs trading strategies in cryptocurrency markets.
 
 - Johannes Fuest — [LinkedIn](https://www.linkedin.com/in/johannesfuest)
 - Victoria Li - [LinkedIn] (https://www.linkedin.com/in/victoriali0123)
+- Ethan Cobb - [LinkedIn] (https://www.linkedin.com/in/ethanbcobb)
 # 
 
 Binance transaction costs - Rakshit
