@@ -97,6 +97,220 @@ def load_data(
     
     return prices, returns, tickers, metadata
 
+# Liquidity measures (the lower, the more liquid the coin)
+# TODO: change from resampling once an hour to having hourly lookbacks each minute
+# def hourly_amihud(df):
+#     """Takes a DataFrame and computes the Amihud illiquidity measure for each coin.
+
+#     Args:
+#         df (pd.DataFrame): A prices df in the non-pivoted format.
+
+#     Returns:
+#         pd.DataFrane: A df with an added Amihud illiquidity measure column.
+#     """
+#     df['return'] = df.groupby('coin')['close'].pct_change()
+#     df['amihud'] = np.abs(df['return']) / df['quote_volume'].replace(0, np.nan)
+    
+#     amihud_records = df.groupby(['coin', pd.Grouper(key='close_time', freq='h')])['amihud'].mean().reset_index()
+#     return amihud_records
+
+# def hourly_roll(df):
+#     """
+#     Computes the Roll serial cov estimator for each coin in the DataFrame.
+
+#     Args:
+#         df (pd.DataFrame): The prices DataFrame in non-pivoted format.
+
+#     Returns:
+#         pd.DataFrame: The same DataFrame with the Roll estimator for each coin added.
+#     """
+#     roll_records = []
+#     for (coin, time), group in df.groupby(['coin', pd.Grouper(key='close_time', freq='h')]):
+#         if group['close'].count() < 3:
+#             roll_val = np.nan
+#         else:
+#             price_diff = group['close'].diff().dropna()
+#             if len(price_diff) >= 2:
+#                 cov = np.cov(price_diff[1:], price_diff[:-1])[0, 1]
+#                 roll_val = 2 * np.sqrt(-cov) if cov < 0 else np.nan
+#             else:
+#                 roll_val = np.nan
+#         roll_records.append({'close_time': time, 'coin': coin, 'roll_estimate': roll_val})
+#     return pd.DataFrame(roll_records)
+
+# def hourly_kyle(df):
+#     """
+#     Computes the Kyle illiquidity measure for each coin in the DataFrame.
+
+#     Args:
+#         df (pd.DataFrame): The prices DataFrame in non-pivoted format.
+
+#     Returns:
+#         pd.DataFrane: The same DataFrame with the Kyle estimator for each coin added.
+#     """
+#     df['return'] = df.groupby('coin')['close'].pct_change()
+#     df['signed_volume'] = df['taker_buy_volume'] - (df['volume'] - df['taker_buy_volume'])
+
+#     kyle_records = []
+#     for (coin, time), group in df.groupby(['coin', pd.Grouper(key='close_time', freq='h')]):
+#         group = group.dropna(subset=['return', 'signed_volume'])
+#         if len(group) < 2:
+#             kyle_val = np.nan
+#         else:
+#             cov = np.cov(group['return'], group['signed_volume'])[0, 1]
+#             var = np.var(group['signed_volume'])
+#             kyle_val = cov / var if var > 0 else np.nan
+#         kyle_records.append({'close_time': time, 'coin': coin, 'kyle_lambda': kyle_val})
+#     return pd.DataFrame(kyle_records)
+
+def hourly_amihud(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    60-minute rolling Amihud illiquidity at every timestamp.
+
+    Returns
+    -------
+    DataFrame with columns ['close_time', 'coin', 'amihud']
+    """
+    df['amihud_raw'] = np.abs(df['return']) / df['quote_volume'].replace(0, np.nan)
+
+    out = []
+    for coin, grp in df.groupby('coin'):
+        grp = grp.set_index('close_time')
+        grp['amihud'] = grp['amihud_raw'].rolling('60min', min_periods=1).mean()
+        out.append(grp[['amihud']].reset_index().assign(coin=coin))
+    return pd.concat(out, ignore_index=True)
+
+
+def hourly_roll(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    60-minute rolling Roll (1984) spread estimate at every timestamp.
+
+    Returns
+    -------
+    DataFrame with columns ['close_time', 'coin', 'roll_estimate']
+    """
+    df = df.copy()
+    df.sort_values(['coin', 'close_time'], inplace=True)
+
+    out = []
+    for coin, grp in df.groupby('coin'):
+        grp = grp.set_index('close_time')
+        price_diff = grp['close'].diff()
+        # custom rolling covariance between consecutive price changes
+        roll_cov = price_diff.rolling('60min', min_periods=3).apply(
+            lambda x: np.cov(x[1:], x[:-1])[0, 1] if len(x) >= 3 else np.nan,
+            raw=False
+        )
+        roll_est = np.where(roll_cov < 0, 2.0 * np.sqrt(-roll_cov), np.nan)
+        out.append(
+            pd.DataFrame(
+                {
+                    'close_time': roll_cov.index,
+                    'roll_estimate': roll_est,
+                    'coin': coin,
+                }
+            )
+        )
+    return pd.concat(out, ignore_index=True)
+
+
+def hourly_kyle(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    60-minute rolling Kyle lambda at every timestamp.
+
+    Returns
+    -------
+    DataFrame with columns ['close_time', 'coin', 'kyle_lambda']
+    """
+    df = df.copy()
+    df.sort_values(['coin', 'close_time'], inplace=True)
+    df['return'] = df.groupby('coin')['close'].pct_change()
+    df['signed_volume'] = df['taker_buy_volume'] - (df['volume'] - df['taker_buy_volume'])
+
+    out = []
+    for coin, grp in df.groupby('coin'):
+        grp = grp.set_index('close_time')
+        cov_r_sv = grp['return'].rolling('60min', min_periods=2).cov(grp['signed_volume'])
+        var_sv = grp['signed_volume'].rolling('60min', min_periods=2).var()
+        kyle_lambda = cov_r_sv / var_sv
+        out.append(
+            pd.DataFrame(
+                {
+                    'close_time': cov_r_sv.index,
+                    'kyle_lambda': kyle_lambda,
+                    'coin': coin,
+                }
+            )
+        )
+    return pd.concat(out, ignore_index=True)
+
+
+def load_data_crypto(
+    config: dict, verbose: bool = False
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Loads and preprocesses the cryptocurrency data.
+
+    Args:
+        config (dict): config, containing the path to the CSV file.
+        verbose (bool, optional): Whether  or not to output details about the data. 
+        Defaults to False.
+
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: prices, returns, tickers.
+    """
+    # Configure pandas display options (feel free to change these)
+    pd.set_option('display.max_columns', 20)
+    pd.set_option('display.max_rows', 20)
+    pd.set_option('display.precision', 4)
+    prices = pd.read_csv(config['CRYPTO_CSV_PATH'], low_memory=False, index_col=0)
+    if verbose:
+        print("Price df shape at load:", prices.shape)
+    # set open_time as index 
+    # Calculate returns
+    returns = prices.pct_change(fill_method=None)
+    # Set initial return to zero
+    returns.iloc[0] = 0
+    prices.index = pd.to_datetime(prices.index)
+    returns.index = pd.to_datetime(returns.index)
+    # price df in raw format including all cols
+    prices_raw = pd.read_csv(config["SAMPLE_PRICES_PATH"])
+    # Convert timestamps to datetime
+    prices_raw['open_time'] = pd.to_datetime(prices_raw['open_time'], unit='ms', utc=True)
+    prices_raw['close_time'] = pd.to_datetime(prices_raw['close_time'], unit='ms', utc=True)
+    prices_raw = prices_raw.sort_values(['coin', 'close_time'])
+    prices_raw['return'] = prices_raw.groupby('coin')['close'].pct_change()
+    amihud_hourly_df = hourly_amihud(prices_raw)
+    #roll_hourly_df = hourly_roll(prices_raw)
+    #kyle_hourly_df = hourly_kyle(prices_raw)
+
+    # %%
+    # Pivot all to common format
+    amihud_pivot = amihud_hourly_df.pivot(index='close_time', columns='coin', values='amihud')
+    # roll_pivot = roll_hourly_df.pivot(index='close_time', columns='coin', values='roll_estimate')
+    # kyle_pivot = kyle_hourly_df.pivot(index='close_time', columns='coin', values='kyle_lambda')
+    
+    
+    if verbose:
+        print("\nPrices head:")
+        display(prices.head())
+ 
+        # Plot NaNs
+        plt.imshow(prices.isna(), aspect='auto', cmap='viridis', interpolation=None)
+        plt.xlabel('Coin')
+        plt.ylabel('Date')
+        plt.title('Missing Data in Binance Crypto Prices')
+        plt.grid(False)
+        plt.show()
+    
+    
+    tickers = prices.columns
+    assert amihud_pivot.columns.equals(tickers), "Amihud columns do not match prices columns"
+    # assert roll_pivot.columns.equals(tickers), "Roll columns do not match prices columns"
+    # assert kyle_pivot.columns.equals(tickers), "Kyle columns do not match prices columns"
+    
+    return prices, returns, tickers, amihud_pivot, # roll_pivot, kyle_pivot
+
 
 def plot_asset_with_max_return(returns, prices, max_rank=0):
     """
@@ -203,6 +417,66 @@ def select_asset_universe(
     return historical_prices[valid_stocks], historical_returns[valid_stocks], valid_stocks
 
 
+def select_asset_universe_crypto(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    amihud: pd.DataFrame,
+    roll: pd.DataFrame,
+    kyle: pd.DataFrame,
+    date: pd.Timestamp,
+    lookback_period:int,
+    criterion: str,
+    max_rank: int = 50,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Index]:
+    """
+    Reduces the cross-section to only those stocks which were members of the asset universe at the given time
+    with sufficient non-missing data and valid returns over the lookback period. Also filters out coins with
+    insufficient liquidity over the lookback period, as defined by the config.
+
+    Args:
+        prices (pd.DataFrame): Minute-level close prices of the coins
+        returns (pd.DataFrame): Minute-level returns of the coins
+        amihud (pd.DataFrame): Amihud illiquidity measure
+        roll (pd.DataFrame): Roll serial cov estimator
+        kyle (pd.DataFrame): Kyle illiquidity measure
+        date (pd.Timestamp): The date at which to select the asset universe
+        lookback_period (int): The number of minutes to look back for filtering
+        criterion (str): The liquidity measure to use for filtering ('amihud', 'roll', or 'kyle')
+
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame, pd.Index]: Prices, returns, and valid coins
+    """
+    # get the index of the date closest to the given date
+    lookback_end_idx = prices.index.get_loc(date)
+    lookback_start_idx = lookback_end_idx - lookback_period
+    liquidity_window = prices.index[lookback_start_idx:lookback_end_idx]
+    
+    # filter out coins with insufficient liquidity
+    if criterion == "amihud":
+        amihud_window = amihud.loc[liquidity_window]
+        ranks = amihud_window.rank(axis=1, method="min", ascending=True)
+        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        ranks_filtered = ranks.loc[:, valid_coins]
+        valid_coins = ranks_filtered.columns
+    
+    elif criterion == "roll":
+        roll_window = roll.loc[liquidity_window]
+        ranks = roll_window.rank(axis=1, method="min", ascending=True)
+        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        ranks_filtered = ranks.loc[:, valid_coins]
+        valid_coins = ranks_filtered.columns
+    elif criterion == "kyle":
+        kyle_window = kyle.loc[liquidity_window]
+        ranks = kyle_window.rank(axis=1, method="min", ascending=True)
+        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        ranks_filtered = ranks.loc[:, valid_coins]
+        valid_coins = ranks_filtered.columns
+    else:
+        raise ValueError(f"Unknown liquidity measure: {criterion}. Valid options are 'amihud', 'roll', or 'kyle'.")
+    
+    return prices[valid_coins], returns[valid_coins], valid_coins
+        
+        
 def form_pairs(prices: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
     Computes the distance between all pairs of stocks based on their normalized price series

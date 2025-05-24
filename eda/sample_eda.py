@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # %%
-# prices = pd.read_csv("/share/data/jfuest_crypto/sample/prices.csv")
-prices = pd.read_csv("/Users/pinkyvicky/Desktop/mse244/crypto_statarb/prices.csv")
+prices = pd.read_csv("/share/data/jfuest_crypto/sample/prices.csv")
+# prices = pd.read_csv("/Users/pinkyvicky/Desktop/mse244/crypto_statarb/prices.csv")
 print(f"Prices data shape: {prices.shape}")
 print(f"Prices data columns: {prices.columns}")
 print(f"Prices data types: {prices.dtypes}")
@@ -27,8 +27,8 @@ print(f"Number of unique coins: {unique_coins}")
 # %%
 print(f"coin values: {prices['coin'].unique()}")
 # %%
-#funding_rates = pd.read_csv("/share/data/jfuest_crypto/sample/funding_rates.csv")
-funding_rates = pd.read_csv("/Users/pinkyvicky/Desktop/mse244/crypto_statarb/funding_rates.csv")
+funding_rates = pd.read_csv("/share/data/jfuest_crypto/sample/funding_rates.csv")
+# funding_rates = pd.read_csv("/Users/pinkyvicky/Desktop/mse244/crypto_statarb/funding_rates.csv")
 print(f"Funding rates data shape: {funding_rates.shape}")
 print(f"Funding rates data columns: {funding_rates.columns}")
 print(f"Funding rates data types: {funding_rates.dtypes}")
