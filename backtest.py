@@ -20,228 +20,67 @@ from scipy import stats
 from statsmodels.graphics.tsaplots import plot_acf
 
 
-
-def load_data(
-    config: dict, verbose: bool = False
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def amihud(df: pd.DataFrame, agg_window: int) -> pd.DataFrame:
     """
-    Loads and processes the Nikkei 225 data.
-    
-    Parameters:
-    -----------
-    config: dict
-        Configuration parameters, containing NIKKEI_CSV_PATH, the filepath to the Nikkei 225 CSV file
-    verbose: bool, optional
-        Whether to print verbose output
-        
+    Amihud illiquidity measure, calculated as the absolute return divided by the quote volume,
+    aggregated over a specified window in minutes.
+
+    Args:
+        df (pd.DataFrame): DataFrame with columns ['close_time', 'coin', 'close', 'quote_volume', 'taker_buy_volume', 'volume'].
+        agg_window (int): The aggregation window in minutes for the rolling calculation.
     Returns:
-    --------
-    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
-        Tuple containing the prices, returns, tickers, and metadata DataFrames
-    """
-    # Configure pandas display options (feel free to change these)
-    pd.set_option('display.max_columns', 20)
-    pd.set_option('display.max_rows', 20)
-    pd.set_option('display.precision', 4)
- 
-    # Load the data
-    prices = pd.read_csv(config['NIKKEI_CSV_PATH'], low_memory=False)
-    if verbose:
-        print("Price df shape at load:", prices.shape)
- 
-    # Slice the prices to only view data up to and including 2017
-    first_2018_idx = prices[prices["Ticker"].str.contains("2018", na=False)].index[0].item()
-    prices = prices.iloc[:first_2018_idx]
-    if verbose:
-        print("Price df shape after slicing time axis:", prices.shape)
- 
-    # Drop columns containing only NaNs (not considering the metadata rows)
-    # These correspond to equities which only come into existence post-2017
-    prices = prices.loc[:, prices.isna().sum() < prices.shape[0] - 3]
-    if verbose:
-        print("Price df shape after removing future asset columns:", prices.shape)
- 
-    # Extract the metadata: industrial classification, sector, and company names
-    metadata = pd.DataFrame(prices.iloc[:3])
-    metadata = metadata.T
-    metadata.columns = metadata.iloc[0]
-    metadata = metadata.iloc[1:]
-    metadata.rename(columns={"Nikkei Industrial Classification": "Industry"}, inplace=True)
- 
-    # Drop the metadata rows and process date
-    prices = prices.iloc[3:]
-    prices.rename(columns={'Ticker':'Date'}, inplace=True)
-    prices['Date'] = pd.to_datetime(prices['Date'])
-    prices.set_index('Date', inplace=True, drop=True)
-    prices = prices.astype(float)
-    tickers = prices.columns
- 
-    # Calculate returns
-    returns = prices.pct_change(fill_method=None)
-    # Set initial return to zero
-    returns.iloc[0] = 0
-    
-    if verbose:
-        print("\nPrices head:")
-        display(prices.head())
-        print("\nMetadata head:")
-        display(metadata.head())
- 
-        # Plot NaNs
-        plt.imshow(prices.isna(), aspect='auto', cmap='viridis', interpolation=None)
-        plt.xlabel('Stock')
-        plt.ylabel('Date')
-        plt.title('Missing Data in Nikkei 225 Prices')
-        plt.grid(False)
-        plt.show()
-    
-    return prices, returns, tickers, metadata
-
-# Liquidity measures (the lower, the more liquid the coin)
-# TODO: change from resampling once an hour to having hourly lookbacks each minute
-# def hourly_amihud(df):
-#     """Takes a DataFrame and computes the Amihud illiquidity measure for each coin.
-
-#     Args:
-#         df (pd.DataFrame): A prices df in the non-pivoted format.
-
-#     Returns:
-#         pd.DataFrane: A df with an added Amihud illiquidity measure column.
-#     """
-#     df['return'] = df.groupby('coin')['close'].pct_change()
-#     df['amihud'] = np.abs(df['return']) / df['quote_volume'].replace(0, np.nan)
-    
-#     amihud_records = df.groupby(['coin', pd.Grouper(key='close_time', freq='h')])['amihud'].mean().reset_index()
-#     return amihud_records
-
-# def hourly_roll(df):
-#     """
-#     Computes the Roll serial cov estimator for each coin in the DataFrame.
-
-#     Args:
-#         df (pd.DataFrame): The prices DataFrame in non-pivoted format.
-
-#     Returns:
-#         pd.DataFrame: The same DataFrame with the Roll estimator for each coin added.
-#     """
-#     roll_records = []
-#     for (coin, time), group in df.groupby(['coin', pd.Grouper(key='close_time', freq='h')]):
-#         if group['close'].count() < 3:
-#             roll_val = np.nan
-#         else:
-#             price_diff = group['close'].diff().dropna()
-#             if len(price_diff) >= 2:
-#                 cov = np.cov(price_diff[1:], price_diff[:-1])[0, 1]
-#                 roll_val = 2 * np.sqrt(-cov) if cov < 0 else np.nan
-#             else:
-#                 roll_val = np.nan
-#         roll_records.append({'close_time': time, 'coin': coin, 'roll_estimate': roll_val})
-#     return pd.DataFrame(roll_records)
-
-# def hourly_kyle(df):
-#     """
-#     Computes the Kyle illiquidity measure for each coin in the DataFrame.
-
-#     Args:
-#         df (pd.DataFrame): The prices DataFrame in non-pivoted format.
-
-#     Returns:
-#         pd.DataFrane: The same DataFrame with the Kyle estimator for each coin added.
-#     """
-#     df['return'] = df.groupby('coin')['close'].pct_change()
-#     df['signed_volume'] = df['taker_buy_volume'] - (df['volume'] - df['taker_buy_volume'])
-
-#     kyle_records = []
-#     for (coin, time), group in df.groupby(['coin', pd.Grouper(key='close_time', freq='h')]):
-#         group = group.dropna(subset=['return', 'signed_volume'])
-#         if len(group) < 2:
-#             kyle_val = np.nan
-#         else:
-#             cov = np.cov(group['return'], group['signed_volume'])[0, 1]
-#             var = np.var(group['signed_volume'])
-#             kyle_val = cov / var if var > 0 else np.nan
-#         kyle_records.append({'close_time': time, 'coin': coin, 'kyle_lambda': kyle_val})
-#     return pd.DataFrame(kyle_records)
-
-def hourly_amihud(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    60-minute rolling Amihud illiquidity at every timestamp.
-
-    Returns
-    -------
-    DataFrame with columns ['close_time', 'coin', 'amihud']
+        pd.DataFrame: DataFrame with columns ['close_time', 'coin', 'amihud'].
     """
     df['amihud_raw'] = np.abs(df['return']) / df['quote_volume'].replace(0, np.nan)
 
     out = []
     for coin, grp in df.groupby('coin'):
         grp = grp.set_index('close_time')
-        grp['amihud'] = grp['amihud_raw'].rolling('60min', min_periods=1).mean()
+        grp['amihud'] = grp['amihud_raw'].rolling(f'{agg_window}min', min_periods=1).mean()
         out.append(grp[['amihud']].reset_index().assign(coin=coin))
     return pd.concat(out, ignore_index=True)
 
 
-def hourly_roll(df: pd.DataFrame) -> pd.DataFrame:
+def kyle(df: pd.DataFrame, agg_window: int) -> pd.DataFrame:
     """
-    60-minute rolling Roll (1984) spread estimate at every timestamp.
-
-    Returns
-    -------
-    DataFrame with columns ['close_time', 'coin', 'roll_estimate']
+    Kyle measure, calculated as the squared return divided by the volume,
+    aggregated over a specified window in minutes.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with columns ['close_time', 'coin', 'close', 'volume', 'return'].
+        agg_window (int): The aggregation window in minutes for the rolling calculation.
+        
+    Returns:
+        pd.DataFrame: DataFrame with columns ['close_time', 'coin', 'kyle'].
     """
-    df = df.copy()
-    df.sort_values(['coin', 'close_time'], inplace=True)
-
+    df["return_squared"] = df['return'] ** 2
     out = []
     for coin, grp in df.groupby('coin'):
         grp = grp.set_index('close_time')
-        price_diff = grp['close'].diff()
-        # custom rolling covariance between consecutive price changes
-        roll_cov = price_diff.rolling('60min', min_periods=3).apply(
-            lambda x: np.cov(x[1:], x[:-1])[0, 1] if len(x) >= 3 else np.nan,
-            raw=False
-        )
-        roll_est = np.where(roll_cov < 0, 2.0 * np.sqrt(-roll_cov), np.nan)
-        out.append(
-            pd.DataFrame(
-                {
-                    'close_time': roll_cov.index,
-                    'roll_estimate': roll_est,
-                    'coin': coin,
-                }
-            )
-        )
+        grp["vol"] = grp["return_squared"].rolling(f"{agg_window}min", min_periods=1).mean()
+        grp["activity"] = grp["volume"].rolling(f"{agg_window}min", min_periods=1).sum()
+        grp["kyle"] = grp["vol"] / grp["activity"].replace(0, np.nan)
+        out.append(grp[["kyle"]].reset_index().assign(coin=coin))
     return pd.concat(out, ignore_index=True)
 
 
-def hourly_kyle(df: pd.DataFrame) -> pd.DataFrame:
+def quote_volume(df: pd.DataFrame, agg_window: int) -> pd.DataFrame:
     """
-    60-minute rolling Kyle lambda at every timestamp.
+    Dollar volume simply the mean of the quote_volume over a specified window in minutes.
 
-    Returns
-    -------
-    DataFrame with columns ['close_time', 'coin', 'kyle_lambda']
+    Args:
+        df (pd.DataFrame): DataFrame with columns ['close_time', 'coin', 'close', 'volume'].
+        agg_window (int): The aggregation window in minutes for the rolling calculation.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns ['close_time', 'coin', 'quote_volume'].
     """
-    df = df.copy()
-    df.sort_values(['coin', 'close_time'], inplace=True)
-    df['return'] = df.groupby('coin')['close'].pct_change()
-    df['signed_volume'] = df['taker_buy_volume'] - (df['volume'] - df['taker_buy_volume'])
-
+    
     out = []
     for coin, grp in df.groupby('coin'):
         grp = grp.set_index('close_time')
-        cov_r_sv = grp['return'].rolling('60min', min_periods=2).cov(grp['signed_volume'])
-        var_sv = grp['signed_volume'].rolling('60min', min_periods=2).var()
-        kyle_lambda = cov_r_sv / var_sv
-        out.append(
-            pd.DataFrame(
-                {
-                    'close_time': cov_r_sv.index,
-                    'kyle_lambda': kyle_lambda,
-                    'coin': coin,
-                }
-            )
-        )
+        grp['quote_volume'] = grp['quote_volume'].rolling(f'{agg_window}min', min_periods=1).mean()
+        out.append(grp[['quote_volume']].reset_index().assign(coin=coin))
     return pd.concat(out, ignore_index=True)
 
 
@@ -257,59 +96,44 @@ def load_data_crypto(
         Defaults to False.
 
     Returns:
-        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: prices, returns, tickers.
+        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot
     """
-    # Configure pandas display options (feel free to change these)
     pd.set_option('display.max_columns', 20)
     pd.set_option('display.max_rows', 20)
     pd.set_option('display.precision', 4)
     prices = pd.read_csv(config['CRYPTO_CSV_PATH'], low_memory=False, index_col=0)
     if verbose:
         print("Price df shape at load:", prices.shape)
-    # set open_time as index 
-    # Calculate returns
     returns = prices.pct_change(fill_method=None)
-    # Set initial return to zero
     returns.iloc[0] = 0
     prices.index = pd.to_datetime(prices.index)
     returns.index = pd.to_datetime(returns.index)
-    # price df in raw format including all cols
     prices_raw = pd.read_csv(config["SAMPLE_PRICES_PATH"])
-    # Convert timestamps to datetime
     prices_raw['open_time'] = pd.to_datetime(prices_raw['open_time'], unit='ms', utc=True)
     prices_raw['close_time'] = pd.to_datetime(prices_raw['close_time'], unit='ms', utc=True)
     prices_raw = prices_raw.sort_values(['coin', 'close_time'])
     prices_raw['return'] = prices_raw.groupby('coin')['close'].pct_change()
-    amihud_hourly_df = hourly_amihud(prices_raw)
-    #roll_hourly_df = hourly_roll(prices_raw)
-    #kyle_hourly_df = hourly_kyle(prices_raw)
-
-    # %%
-    # Pivot all to common format
-    amihud_pivot = amihud_hourly_df.pivot(index='close_time', columns='coin', values='amihud')
-    # roll_pivot = roll_hourly_df.pivot(index='close_time', columns='coin', values='roll_estimate')
-    # kyle_pivot = kyle_hourly_df.pivot(index='close_time', columns='coin', values='kyle_lambda')
-    
+    amihud_df = amihud(prices_raw, config["liquidity_interval"])
+    kyle_df = kyle(prices_raw, config["liquidity_interval"])
+    quote_volume_df = quote_volume(prices_raw, config["liquidity_interval"])
+    amihud_pivot = amihud_df.pivot(index='close_time', columns='coin', values='amihud')
+    kyle_pivot = kyle_df.pivot(index='close_time', columns='coin', values='kyle')
+    quote_volume_pivot = quote_volume_df.pivot(index='close_time', columns='coin', values='quote_volume')
     
     if verbose:
         print("\nPrices head:")
         display(prices.head())
- 
-        # Plot NaNs
         plt.imshow(prices.isna(), aspect='auto', cmap='viridis', interpolation=None)
         plt.xlabel('Coin')
         plt.ylabel('Date')
         plt.title('Missing Data in Binance Crypto Prices')
         plt.grid(False)
         plt.show()
-    
-    
+        
     tickers = prices.columns
     assert amihud_pivot.columns.equals(tickers), "Amihud columns do not match prices columns"
-    # assert roll_pivot.columns.equals(tickers), "Roll columns do not match prices columns"
-    # assert kyle_pivot.columns.equals(tickers), "Kyle columns do not match prices columns"
-    
-    return prices, returns, tickers, amihud_pivot, # roll_pivot, kyle_pivot
+    assert kyle_pivot.columns.equals(tickers), "Kyle columns do not match prices columns"
+    return prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot
 
 
 def plot_asset_with_max_return(returns, prices, max_rank=0):
@@ -367,66 +191,14 @@ def plot_asset_with_max_return(returns, prices, max_rank=0):
     plt.show()
 
 
-def select_asset_universe(
-    prices: pd.DataFrame, 
-    returns: pd.DataFrame, 
-    date: pd.Timestamp, 
-    config: dict,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Index]:
-    """
-    Reduces the cross-section to only those stocks which were members of the asset universe at the given time
-    with sufficient non-missing data and valid returns over the lookback period.
-    
-    Parameters:
-    -----------
-    prices: pd.DataFrame
-        Dataframe of stock prices with dates as index and tickers as columns
-    returns: pd.DataFrame
-        Dataframe of stock returns with dates as index and tickers as columns
-    date: pd.Timestamp
-        The reference date
-    config: dict
-        Configuration parameters, including 
-        - FORMATION_PERIOD: int, the number of trading days to use for forming pairs, and thus also 
-            for checking data availability, e.g. 252 days
-        - FILTER_MAX_ABS_RETURN: float, the maximum absolute return allowed, e.g. 0.5
-        
-    Returns:
-    --------
-    Tuple[pd.DataFrame, pd.DataFrame, pd.Index]
-        Tuple containing the selected historical prices, returns, and valid stocks
-    """
-    # grab the past lookback_period days ending at but not including date
-    lookback_period = config['FORMATION_PERIOD'] # num of days to use
-    end_idx = prices.index.get_loc(date)
-    start_idx = end_idx - lookback_period
-    # get the range of dates over lookback_period
-    lookback_idx = prices.index[start_idx:end_idx]
-
-    # filter out stocks with any missing prices in lookback period
-    historical_prices = prices.loc[lookback_idx]
-    prices_no_nan = ~historical_prices.isna().any()
-
-    # filter out stocks with crazy returns
-    max_return = config['FILTER_MAX_ABS_RETURN']
-    historical_returns = returns.loc[lookback_idx]
-    valid_returns = (historical_returns.abs() <= max_return).all()
-
-    # extract only stocks that fulfill both filter conditions
-    valid_stocks = prices.columns[prices_no_nan & valid_returns]
-    return historical_prices[valid_stocks], historical_returns[valid_stocks], valid_stocks
-
-
 def select_asset_universe_crypto(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
     amihud: pd.DataFrame,
-    roll: pd.DataFrame,
     kyle: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
     date: pd.Timestamp,
-    lookback_period:int,
-    criterion: str,
-    max_rank: int = 50,
+    config: dict,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Index]:
     """
     Reduces the cross-section to only those stocks which were members of the asset universe at the given time
@@ -440,40 +212,54 @@ def select_asset_universe_crypto(
         roll (pd.DataFrame): Roll serial cov estimator
         kyle (pd.DataFrame): Kyle illiquidity measure
         date (pd.Timestamp): The date at which to select the asset universe
-        lookback_period (int): The number of minutes to look back for filtering
-        criterion (str): The liquidity measure to use for filtering ('amihud', 'roll', or 'kyle')
+        config (dict): Configuration parameters, containing the keys:
+            - 'liquidity_interval': Interval in minutes for aggregating liquidity measures
+            - 'liquidity_filter_length': Length of the lookback period for liquidity filtering
+            - 'criterion': Liquidity measure to use ('amihud', 'kyle', or 'quote_volume')
+            - 'max_rank': Maximum rank of coins to keep based on the liquidity measure
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, pd.Index]: Prices, returns, and valid coins
     """
+    criterion = config["criterion"]
+    max_rank = config["max_rank"]
+    interval = config["liquidity_interval"]
+    
     # get the index of the date closest to the given date
     lookback_end_idx = prices.index.get_loc(date)
-    lookback_start_idx = lookback_end_idx - lookback_period
+    lookback_start_idx = lookback_end_idx - config['liquidity_filter_length']
     liquidity_window = prices.index[lookback_start_idx:lookback_end_idx]
     
     # filter out coins with insufficient liquidity
     if criterion == "amihud":
         amihud_window = amihud.loc[liquidity_window]
+        if interval > 1:
+            amihud_window = amihud_window.iloc[::interval, :]
         ranks = amihud_window.rank(axis=1, method="min", ascending=True)
         valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
         ranks_filtered = ranks.loc[:, valid_coins]
         valid_coins = ranks_filtered.columns
     
-    elif criterion == "roll":
-        roll_window = roll.loc[liquidity_window]
-        ranks = roll_window.rank(axis=1, method="min", ascending=True)
-        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
-        ranks_filtered = ranks.loc[:, valid_coins]
-        valid_coins = ranks_filtered.columns
     elif criterion == "kyle":
         kyle_window = kyle.loc[liquidity_window]
+        if interval > 1:
+            kyle_window = kyle_window.iloc[::interval, :]
         ranks = kyle_window.rank(axis=1, method="min", ascending=True)
         valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
         ranks_filtered = ranks.loc[:, valid_coins]
         valid_coins = ranks_filtered.columns
+        
+    elif criterion == "quote_volume":
+        dollar_volume_window = dollar_volume.loc[liquidity_window]
+        if interval > 1:
+            # keep only every nth row based on granularity
+            dollar_volume_window = dollar_volume_window.iloc[::interval, :]
+        ranks = dollar_volume_window.rank(axis=1, method="max", ascending=False)
+        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        ranks_filtered = ranks.loc[:, valid_coins]
+        valid_coins = ranks_filtered.columns
     else:
-        raise ValueError(f"Unknown liquidity measure: {criterion}. Valid options are 'amihud', 'roll', or 'kyle'.")
-    
+        raise ValueError(f"Unknown liquidity measure: {criterion}. Valid options are 'amihud', 'kyle', or 'quote_volume'.")
     return prices[valid_coins], returns[valid_coins], valid_coins
         
         
