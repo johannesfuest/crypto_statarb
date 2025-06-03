@@ -4,6 +4,7 @@ statsmodels
 scikit-learn
 numpy
 seaborn
+fastdtw
 tqdm
 notebook
 optuna
