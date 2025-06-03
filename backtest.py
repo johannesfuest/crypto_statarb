@@ -6,6 +6,7 @@ import warnings
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import itertools
 import arch.unitroot
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mpl_ticker
@@ -18,6 +19,18 @@ import statsmodels.api as sm
 from IPython.display import display
 from scipy import stats
 from statsmodels.graphics.tsaplots import plot_acf
+
+from dist_metrics.temporal_distances import (
+    lcs_distance,
+    dtw_distance,
+)
+
+from dist_metrics.basic_distance_metrics import (
+    ssd,
+    manhattan,
+    euclidean,
+    correlation_distance,
+)
 
 
 def amihud(df: pd.DataFrame, agg_window: int) -> pd.DataFrame:
@@ -263,44 +276,52 @@ def select_asset_universe_crypto(
     return prices[valid_coins], returns[valid_coins], valid_coins
         
         
-def form_pairs(prices: pd.DataFrame, config: dict) -> pd.DataFrame:
+def form_pairs_crypto(prices: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
     Computes the distance between all pairs of stocks based on their normalized price series
-    and returns information on the top `NUM_PAIRS` pairs with lowest distances.
+    and returns information on the top `n_pairs` pairs with lowest distances.
     
     Parameters:
     -----------
     prices: pd.DataFrame
         Dataframe of stock prices with dates as index and tickers as columns
     config: dict
-        Configuration parameters, containing the key `NUM_PAIRS`, with a value such as 20
+        Configuration parameters, containing the key `n_pairs`, with a value such as 20,
+        as well as the distance metric to use, specified by the key `dist_metric`.
         
     Returns:
     --------
     pd.DataFrame
-        Dataframe with top `NUM_PAIRS` pairs sorted by distance
+        Dataframe with top `n_pairs` pairs sorted by distance
     """
-    # Normalize the prices to start at 1 for each column
-    filtered_prices = (prices / prices.iloc[0]).copy()
-    # Calculate the distance matrix
-    distances = {}
-    for i in range(len(filtered_prices.columns)):
-        for j in range(i + 1, len(filtered_prices.columns)):
-            stock1 = filtered_prices.iloc[:, i]
-            stock2 = filtered_prices.iloc[:, j]
-            if config['DISTANCE_METRIC'] == 'ssd':
-                distance = np.sum((stock1 - stock2) ** 2)
-            elif config['DISTANCE_METRIC'] == 'correlation':
-                distance = 1 - np.corrcoef(stock1, stock2)[0, 1]
-            else:
-                raise ValueError(f"Unknown distance metric: {config['DISTANCE_METRIC']}")
-            distances[(filtered_prices.columns[i], filtered_prices.columns[j])] = distance
-    # get the top N_PAIRS pairs
-    pairs = sorted(distances.items(), key=lambda x: x[1])[:config['NUM_PAIRS']]
-    # create a DataFrame to hold the pairs
-    pairs_df = pd.DataFrame(columns=["stock1", "stock2", f"distance"])
-    for i, ((stock1, stock2), distance) in enumerate(pairs):
-        pairs_df.loc[i] = [stock1, stock2, distance]
+    num_pairs = config["n_pairs"]
+    normalized_prices = (prices / prices.iloc[0]).copy()
+
+    distances = []
+    for stock_1, stock_2 in itertools.combinations(prices.columns, 2):
+        
+        stock_1_prices = normalized_prices[stock_1]
+        stock_2_prices = normalized_prices[stock_2]
+        match config['dist_metric']:
+            case "ssd":
+                distance = ssd(stock_1_prices, stock_2_prices)
+            case "manhattan":
+                distance = manhattan(stock_1_prices, stock_2_prices)
+            case "euclidean":
+                distance = euclidean(stock_1_prices, stock_2_prices)
+            case "correlation":
+                distance = correlation_distance(stock_1_prices, stock_2_prices)
+            case "dtw":
+                distance = dtw_distance(stock_1_prices, stock_2_prices)
+            case "lcs":
+                distance = lcs_distance(stock_1_prices, stock_2_prices)
+            case _:
+                raise ValueError(f"Unrecognized distance metric: {config['dist_metric']}")
+        distances.append({'stock1': stock_1, 'stock2': stock_2, 'distance': distance})
+
+    pairs_df_full = pd.DataFrame(distances)
+    pairs_df_full = pairs_df_full.sort_values(by='distance').reset_index(drop=True)
+    pairs_df = pairs_df_full.head(num_pairs)
     return pairs_df
 
 def _beta_ols(x: pd.Series, y: pd.Series) -> float:
@@ -715,6 +736,9 @@ def update_portfolio(
 def implement_strategy(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
+    amihud: pd.DataFrame,
+    kyle: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
     config: dict,
 ) -> tuple:
     """
@@ -743,7 +767,7 @@ def implement_strategy(
     prev_portfolio_value = None
     position_timestamps = {}  # Tracks when each position was entered
     
-    # Split the data into formation and trading periods
+    # Split the data into formation and trading periods # TODO: doesn't this leave out the last period?
     for i in range(0, len(trading_dates) - config['FORMATION_PERIOD'] - config['TRADING_PERIOD'], config['TRADING_PERIOD']):
         # Define formation and trading periods
         formation_start = trading_dates[i]
@@ -755,14 +779,14 @@ def implement_strategy(
         print("Trading period: %s to %s" % (trading_start, trading_end))
         
         # Select stocks for the formation period
-        formation_stocks, _, _ = select_asset_universe(prices, returns, formation_end, config)
+        formation_stocks, _, _ = select_asset_universe_crypto(prices, returns, formation_end, config)
         
         if formation_stocks.empty or formation_stocks.shape[1] < 2:
             print("Not enough stocks with complete data in the formation period. Skipping.")
             continue
         
         # Compute distances between pairs
-        pairs = form_pairs(formation_stocks, config)
+        pairs = form_pairs_crypto(formation_stocks, config)
         
         # Estimate hedge ratios
         hedge_ratios = estimate_hedge_ratio(formation_stocks, pairs, config)
@@ -1580,12 +1604,12 @@ def validate_config(config: dict) -> None:
     --------
     None
     """
-    assert config['NIKKEI_CSV_PATH'], "Nikkei CSV path must be specified"
-    assert config['FILTER_MAX_ABS_RETURN'] >= 0, "Filter max absolute return must be non-negative"
+    assert config['CRYPTO_CSV_PATH'], "Crypto CSV path must be specified"
+    assert config['SAMPLE_PRICES_PATH'], "Sample prices path must be specified"
     assert config['FORMATION_PERIOD'] > 0, "Formation period must be positive"
     assert config['TRADING_PERIOD'] > 0, "Trading period must be positive"
-    assert config['NUM_PAIRS'] > 0, "Number of pairs must be positive"
-    assert config['DISTANCE_METRIC'] in ['ssd'], "Distance metric must be 'ssd'"
+    assert config['n_pairs'] > 0, "Number of pairs must be positive"
+    assert config['dist_metric'] in ['ssd'], "Distance metric must be 'ssd'"
     assert config['HEDGE_RATIO_METHOD'] in ['ols', 'unit'], "Hedge ratio method must be 'ols' or 'unit'"
     assert 0 < config['COINT_THRESHOLD'] < 1, "Cointegration threshold must be in (0, 1)"
     assert config['ESTIMATION_PERIOD'] > 0, "Estimation period must be positive"
@@ -1601,47 +1625,10 @@ def validate_config(config: dict) -> None:
     # assert config['CLOSE_OLD_POSITIONS'] in [True, False], "Close old positions must be True or False"
 
 
-def run_backtest(config=None):
+def run_backtest(config):
     """
     Runs the full strategy and analyzes performance.
     """
-    # Parameters
-    config = config or {
-        # Save results
-        'SAVE_RESULTS': True,
-        # Path to the Nikkei 225 CSV file
-        'NIKKEI_CSV_PATH': 'N225.csv',
-        # The maximum absolute return allowed, e.g. 0.5
-        'FILTER_MAX_ABS_RETURN': 0.5,
-        # Length of formation period, in trading days; also used as period to select asset universe based on data availability and returns
-        'FORMATION_PERIOD': 252,
-        # Length of trading period, in trading days
-        'TRADING_PERIOD': 126,
-        # Top number of pairs to select for trading
-        'NUM_PAIRS': 50,
-        # Distance metric to use for selecting pairs
-        'DISTANCE_METRIC': 'ssd',
-        # Method to use for hedge ratio estimation ("ols" or "unit" or your own)
-        'HEDGE_RATIO_METHOD': 'unit',
-        # Cointegration p-value threshold for choosing pairs (set to 0.05 for 5% significance level)
-        'COINT_THRESHOLD': 0.05,
-        # Length of rolling mean/volatility estimation period for spreads, in trading days
-        'ESTIMATION_PERIOD': 20,
-        # Z-score threshold for generating signals
-        'Z_THRESHOLD': 2.0,
-        # Transaction cost as a fraction of trade value in percentage (0.0001 = 1 bps)
-        'TRANSACTION_COST': 0.0005,
-        # Daily borrowing cost for leverage in percentage (0.0001 = 1 bps); multiply by 252 to convert to annual rate
-        'BORROW_RATE_DAILY': 0.03 / 252,
-        # Leverage rate daily on balanced leverage in percentage (0.0001 = 1 bps); multiply by 252 to convert to annual rate
-        'LEVERAGE_RATE_DAILY': 0.01 / 252,
-        # Margin rate daily on unbalanced (excess) leverage in percentage (0.0001 = 1 bps); multiply by 252 to convert to annual rate
-        'MARGIN_RATE_DAILY': 0.05 / 252,
-        # Initial cash amount
-        'INITIAL_CASH': 1_000_000.0,
-        # Maximum leverage to target
-        'MAX_LEVERAGE': 0.05,
-    }
     
     print(f"Starting from '{os.getcwd()}'")
     
@@ -1652,7 +1639,7 @@ def run_backtest(config=None):
     unique_id = get_unique_id(config)
     
     # Load the data
-    prices, returns, tickers, metadata = load_data(config)
+    prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot = load_data_crypto(config)
     
     # Load results if extant, otherwise run strategy
     results = load_results(unique_id)
@@ -1660,6 +1647,9 @@ def run_backtest(config=None):
         results = implement_strategy(
             prices,
             returns,
+            amihud_pivot,
+            kyle_pivot,
+            quote_volume_pivot,
             config,
         )
         if config['SAVE_RESULTS']:
