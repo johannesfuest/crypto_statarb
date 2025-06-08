@@ -3,9 +3,6 @@ import json
 import os
 import pickle
 import warnings
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
-
 import itertools
 import arch.unitroot
 import matplotlib.pyplot as plt
@@ -19,6 +16,8 @@ import statsmodels.api as sm
 from IPython.display import display
 from scipy import stats
 from statsmodels.graphics.tsaplots import plot_acf
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dist_metrics.temporal_distances import (
     lcs_distance,
@@ -324,24 +323,6 @@ def form_pairs_crypto(prices: pd.DataFrame, config: dict) -> pd.DataFrame:
     pairs_df = pairs_df_full.head(num_pairs)
     return pairs_df
 
-def _beta_ols(x: pd.Series, y: pd.Series) -> float:
-    """
-    Hedge ratio from OLS regression of y on x:
-        y_t = β · x_t + ε_t
-    """
-    x = x.values.reshape(-1, 1)
-    model = sm.OLS(y.values, sm.add_constant(x)).fit()
-    return float(model.params[1])
-
-
-def _beta_median(x: pd.Series, y: pd.Series) -> float:
-    """
-    Extra-credit hedge-ratio estimator:
-    use the **median** price ratio rather than the mean / OLS—
-    more robust to outliers and clearly different from OLS.
-    """
-    return float(np.median(y / x))  
-
 
 def estimate_hedge_ratio(prices: pd.DataFrame, pairs: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
@@ -359,57 +340,48 @@ def estimate_hedge_ratio(prices: pd.DataFrame, pairs: pd.DataFrame, config: dict
     pd.DataFrame
         Dataframe with betas and cointegration information for each pair
     """
-    method = config.get("HEDGE_RATIO_METHOD", "ols").lower()
-    thresh = config.get("COINT_THRESHOLD", 0.05)
-
-    # Pick the appropriate estimator once
-    if method == "ols":
-        beta_fn = _beta_ols
-    elif method == "unit":
-        beta_fn = lambda x, y: 1.0
-    elif method == "median":           # ← extra‑credit method
-        beta_fn = _beta_median
-    else:
-        raise ValueError(
-            f"Unknown HEDGE_RATIO_METHOD '{method}'. "
-            "Valid choices are 'ols', 'unit', or 'median'."
-        )
-
     results = []
+    # loop over pairs of stocks and compute betas, conintegration info
+    for _, row  in pairs.iterrows(): 
+        stock_1, stock_2 = row['stock1'], row['stock2']
+        # extract price series for each stock
+        prices_1, prices_2 = prices[stock_1], prices[stock_2]
+        # compute hedge ratio between the two stocks
+        if config['HEDGE_RATIO_METHOD'] == 'ols': 
+            # regress stock 2 on stock 1
+            res = stats.linregress(prices_1, prices_2)
+            # hedge ratio = slope of ols regression
+            hedge_ratio_signed = res.slope
+        elif config['HEDGE_RATIO_METHOD'] == 'unit': 
+            hedge_ratio_signed = 1.0
+        elif config['HEDGE_RATIO_METHOD'] == 'mvhr': 
+            # custom method based on research: min variance hedge ratio
+            # MVHR = cov(p1, p2)/var(p1)
+            cov = np.cov(prices_1, prices_2)[0, 1] # off diag element captures cov
+            var = np.var(prices_1)
+            hedge_ratio_signed = cov / var
+        else: raise ValueError("Unrecognized hedge ratio method.")
 
-    for _, row in pairs.iterrows():
-        s1, s2 = row["stock1"], row["stock2"]
-        price1, price2 = prices[[s1, s2]].dropna().T.values
+        # compute spread
+        spread = prices_2 - hedge_ratio_signed * prices_1
+        # perform ADF test on the spread
+        adf = arch.unitroot.ADF(spread)
+        # extract ADF statistic, p-value
+        adf_stat, adf_pvalue = adf.stat, adf.pvalue
+        # store stats in table
+        is_cointegrated = adf_pvalue <= config['COINT_THRESHOLD']   
 
-        # Skip if insufficient overlapping history
-        if price1.size < 30:   # arbitrary “enough data” rule of thumb
-            continue
-
-        beta = beta_fn(price1, price2)
-        # Keep β positive for reporting but retain its sign in the spread
-        beta_sign = np.sign(beta) if beta != 0 else 1.0
-        beta_abs  = abs(beta)
-
-        spread = price2 - beta * price1
-
-        adf_res = arch.unitroot.ADF(spread)
-        adf_stat, pval = adf_res.stat, adf_res.pvalue
-        is_coint = pval <= thresh
-        if is_coint:
-            results.append(
-                {
-                    "stock1": s1,
-                    "stock2": s2,
-                    "hedge_ratio": beta_abs,
-                    "distance": row["distance"],
-                    "adf_stat": adf_stat,
-                    "adf_pvalue": pval,
-                    "is_cointegrated": is_coint,
-                }
-            )
+        results.append({'stock1': stock_1, 'stock2': stock_2, 
+                        'hedge_ratio': abs(hedge_ratio_signed), 
+                        'distance': row['distance'], 'adf_stat': adf_stat, 
+                        'adf_pvalue': adf_pvalue, 
+                        'is_cointegrated': is_cointegrated})      
 
     results_df = pd.DataFrame(results)
-    return results_df
+    # filter results to only include pairs with p-value less than threshold
+    filtered_results = results_df[results_df['is_cointegrated']].reset_index(drop=True)
+
+    return filtered_results
 
 
 def compute_signal(prices: pd.DataFrame, hedge_ratios: pd.DataFrame, config: dict) -> dict:
@@ -510,51 +482,66 @@ def allocate_positions(
     dict
         Dictionary with position information for each stock
     """
-    positions = {}
-    active_pairs = {}
+    positions = {} # will store positions for each stock: stock_name -> num shares
+
+    # handle edge cases
     if date not in prices.index:
         return positions
     if portfolio_cash is None or portfolio_cash <= 0:
         return positions
-    for key, value in signals.items():
-        stock1 = value["stock1"]
-        stock2 = value["stock2"]
-        try:
-            price1 = prices[stock1].loc[date]
-            price2 = prices[stock2].loc[date]
-        except KeyError:
+    
+    # collect active pairs for the current date
+    active_pairs = []
+    for pair_str, signal_dict in signals.items():
+        stock_1, stock_2 = signal_dict['stock1'], signal_dict['stock2']
+        hedge_ratio = signal_dict['hedge_ratio']
+        signal = signal_dict['signal'] # Series representing the trading signal
+
+        # skip pairs where we don't have price data for both stocks
+        if stock_1 not in prices.columns or stock_2 not in prices.columns:
             continue
-        
-        signal = value["signal"].shift(1).loc[date]
-        
-        if signal is None or np.isnan(signal) or signal == 0:
+        # get signal from yesterday for today's execution
+        date_idx = signal.index.get_loc(date)
+        if date_idx == 0: # no previous day
             continue
-        
-        active_pairs[key] = {
-            "stock1": stock1,
-            "stock2": stock2,
-            "hedge_ratio": value["hedge_ratio"],
-            "signal": signal,
-            "price1": price1,
-            "price2": price2,
-        }
+        signal_value = signal.iloc[date_idx - 1] # signal from yesterday
+        # skip zero/NaN signals
+        if signal_value == 0 or pd.isna(signal_value):
+            continue
+        # otherwise, store dict of info for the active pair
+        active_pairs.append({'stock1': stock_1, 'stock2': stock_2, 'hedge_ratio': hedge_ratio, 
+                            'signal': signal_value, 'price1': prices.at[date, stock_1], 
+                            'price2': prices.at[date, stock_2]})
+
+    # if no activate pairs found, return empty positions
     if len(active_pairs) == 0:
         return positions
-    # Calculate the position size for each pair
-    capital_per_pair = (portfolio_cash * config["MAX_LEVERAGE"]) / len(active_pairs)
-    for pair, info in active_pairs.items():
-        stock1 = info["stock1"]
-        stock2 = info["stock2"]
-        if positions.get(stock1, None) is None:
+    
+    # allocate capital equally across all active pairs
+    num_active_pairs = len(active_pairs)
+    capital_per_pair = (portfolio_cash * config['MAX_LEVERAGE']) / num_active_pairs
+
+    for pair in active_pairs:
+        # extract info for pair
+        stock1, stock2 = pair['stock1'], pair['stock2']
+        price1, price2 = pair['price1'], pair['price2']
+        hedge_ratio = pair['hedge_ratio']
+        signal_value = pair['signal']
+
+        # calculate balanced position sizes using a notional ratio approach
+        notional_ratio = (hedge_ratio * price2) / price1
+        shares1 = capital_per_pair / (price1 * (1 + notional_ratio))
+        shares2 = shares1 * hedge_ratio
+
+        # initialize positions for both stocks if they don’t exist in the positions dictionary
+        if stock1 not in positions: 
             positions[stock1] = 0
-        if positions.get(stock2, None) is None:
-            positions[stock2] = 0
-        notional_ratio = (info["hedge_ratio"] * info["price2"]) / info["price1"]
-        shares1 = capital_per_pair / (info["price1"] * (1 + notional_ratio))
-        shares2 = shares1 * info["hedge_ratio"]
-        signal_value = info["signal"]
+        if stock2 not in positions:
+            positions[stock2] = 0 
+        # update positions based on signal
         positions[stock1] += -signal_value * shares1
         positions[stock2] += signal_value * shares2
+    
     return positions
 
 
@@ -767,7 +754,7 @@ def implement_strategy(
     prev_portfolio_value = None
     position_timestamps = {}  # Tracks when each position was entered
     
-    # Split the data into formation and trading periods # TODO: doesn't this leave out the last period?
+    # Split the data into formation and trading periods
     for i in range(0, len(trading_dates) - config['FORMATION_PERIOD'] - config['TRADING_PERIOD'], config['TRADING_PERIOD']):
         # Define formation and trading periods
         formation_start = trading_dates[i]
@@ -779,7 +766,7 @@ def implement_strategy(
         print("Trading period: %s to %s" % (trading_start, trading_end))
         
         # Select stocks for the formation period
-        formation_stocks, _, _ = select_asset_universe_crypto(prices, returns, formation_end, config)
+        formation_stocks, _, _ = select_asset_universe_crypto(prices, returns, amihud, kyle, dollar_volume, formation_end, config)
         
         if formation_stocks.empty or formation_stocks.shape[1] < 2:
             print("Not enough stocks with complete data in the formation period. Skipping.")
@@ -808,7 +795,6 @@ def implement_strategy(
                     'stock2': pair_row['stock2'],
                     'distance': pair_row['distance'],
                     'hedge_ratio': pair_row['hedge_ratio'],
-                    # 'half_life': pair_row['half_life'],
                     'adf_pvalue': pair_row['adf_pvalue']
                 })
         
@@ -931,7 +917,6 @@ def analyze_performance(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
     tickers: list,
-    metadata: pd.DataFrame,
     portfolio_history: dict, 
     metrics_df: pd.DataFrame, 
     pairs_df: pd.DataFrame,
@@ -949,8 +934,6 @@ def analyze_performance(
         Dataframe with stock returns
     tickers: list
         List of stock tickers
-    metadata: pd.DataFrame
-        Dataframe with stock metadata
     portfolio_history: dict
         Dictionary with portfolio history
     metrics_df: pd.DataFrame
@@ -965,7 +948,7 @@ def analyze_performance(
     """
     # Initialize variables
     initial_cash = config['INITIAL_CASH']
-    num_pairs = config['NUM_PAIRS']
+    num_pairs = config['n_pairs']
     transaction_cost = config['TRANSACTION_COST']
     borrow_rate_daily = config['BORROW_RATE_DAILY']
     metrics = {}
@@ -1014,8 +997,6 @@ def analyze_performance(
     
     # Plot gross returns if available
     ((1 + metrics_df['gross_returns']).cumprod() - 1).plot(label='Gross Returns')
-    
-    # TODO: Plot benchmark returns if available
         
     plt.title('Cumulative Returns')
     plt.xlabel('Date')
@@ -1135,24 +1116,13 @@ def analyze_performance(
         plt.tight_layout()
         plt.show()
         
-        # Display the metadata and the of the top 10 pairs
+        # Display the top 10 pairs
         top_pairs_info = pair_counts.head(10).to_frame()
         top_pairs_info['ticker1'] = top_pairs_info.index.to_series().str.split('_').str[0]
         top_pairs_info['ticker2'] = top_pairs_info.index.to_series().str.split('_').str[1]
-        top_pairs_info = pd.merge(top_pairs_info, metadata, left_on='ticker1', right_index=True, how='left')
-        top_pairs_info = pd.merge(top_pairs_info, metadata, left_on='ticker2', right_index=True, how='left')
-        top_pairs_info['ticker1_name'] = top_pairs_info['Company_x']
-        top_pairs_info['ticker2_name'] = top_pairs_info['Company_y']
-        top_pairs_info['ticker1_sector'] = top_pairs_info['Sector_x']
-        top_pairs_info['ticker2_sector'] = top_pairs_info['Sector_y']
-        top_pairs_info['ticker1_industry'] = top_pairs_info['Industry_x']
-        top_pairs_info['ticker2_industry'] = top_pairs_info['Industry_y']
+
         
-        top_pairs_info = top_pairs_info[[
-            'ticker1', 'ticker1_name', 'ticker1_sector', 'ticker1_industry', 
-            'ticker2', 'ticker2_name', 'ticker2_sector', 'ticker2_industry', 
-            'count',
-        ]]
+        top_pairs_info = top_pairs_info[['ticker1', 'ticker2', 'count',]]
         
         print("\nTop 10 Most Frequent Pairs:")
         with pd.option_context('display.max_columns', None, 'display.max_rows', None):
@@ -1176,15 +1146,6 @@ def analyze_performance(
         plt.xticks(rotation=0)
         plt.grid(True)
         plt.show()
-        
-        # # Analyze half-lives
-        # plt.figure(figsize=(12, 6))
-        # plt.hist(pairs_df['half_life'], bins=20)
-        # plt.title('Distribution of Half-Lives')
-        # plt.xlabel('Half-Life (days)')
-        # plt.ylabel('Frequency')
-        # plt.grid(True)
-        # plt.show()
         
         # Add pair statistics to metrics
         metrics['Total Unique Pairs'] = len(pair_counts)
@@ -1366,6 +1327,7 @@ def analyze_performance(
     
     # Basic monthly returns heatmap (using net returns)
     try:
+        metrics_df.index = pd.to_datetime(metrics_df.index)
         monthly_returns = metrics_df['net_returns'].resample('ME').apply(lambda x: (1 + x).prod() - 1)
         
         # Create a DataFrame with the right structure for pivot
@@ -1419,7 +1381,6 @@ def analyze_performance(
         print(f"Could not generate monthly/annual return tables: {e}")
         raise e
     
-    # TODO: Add more metrics/tests from quantstats and Gatev et al. 2006
     
     # Display performance metrics as a table
     summary_metrics_df = pd.DataFrame({
@@ -1665,7 +1626,6 @@ def run_backtest(config):
         prices, 
         returns, 
         tickers, 
-        metadata,
         *results,
     )
         
@@ -1673,7 +1633,6 @@ def run_backtest(config):
         prices,
         returns,
         tickers,
-        metadata,
         *results
     )
 
