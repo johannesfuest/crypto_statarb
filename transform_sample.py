@@ -12,6 +12,7 @@ def load_sample(server: bool = False) -> pd.DataFrame:
     if server:
         # Load data from the server
         prices = pd.read_csv("/share/data/jfuest_crypto/sample/prices.csv")
+        # prices = pd.read_csv("/Users/pinkyvicky/Desktop/mse244/crypto_statarb/prices_raw.csv")
     else:
         # Load data from local path
         prices = pd.read_csv("prices.csv")

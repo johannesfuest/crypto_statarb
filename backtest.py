@@ -204,7 +204,7 @@ def plot_asset_with_max_return(returns, prices, max_rank=0):
     plt.show()
 
 
-def select_asset_universe_crypto(
+def select_asset_universe_crypto_old(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
     amihud: pd.DataFrame,
@@ -274,7 +274,89 @@ def select_asset_universe_crypto(
     else:
         raise ValueError(f"Unknown liquidity measure: {criterion}. Valid options are 'amihud', 'kyle', or 'quote_volume'.")
     return prices[valid_coins], returns[valid_coins], valid_coins
-        
+
+
+def select_asset_universe_crypto(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    amihud: pd.DataFrame,
+    kyle: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
+    date: pd.Timestamp,
+    config: dict,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Index]:
+    """
+    Select cryptos that are in the top‐X by each of Amihud, Kyle, and dollar volume
+     in the lookback window, applying three thresholds in sequence.
+
+    Args:
+        prices, returns: minute-level DataFrames of prices/returns (idx=Datetime, cols=tickers).
+        amihud, kyle, dollar_volume: DataFrames indexed by minute, cols=tickers.
+        date: snapshot date for filtering.
+        config:
+          - liquidity_interval: int, sub-sampling interval for minute to day.
+          - liquidity_filter_length: number of rows to look back.
+          - liquidity_thresholds: list of ints, e.g. [120, 100, 80].
+
+    Returns:
+        (prices_filt, returns_filt, final_universe)
+    """
+    # grab lookback window of days
+    idx = prices.index.get_loc(date)
+    start = idx - config["liquidity_filter_length"]
+    window_dates = prices.index[start:idx]
+
+    # build daily‐frequency liquidity windows
+    am_w = amihud.loc[window_dates]
+    # ky_w = kyle.loc[window_dates]
+    dv_w = dollar_volume.loc[window_dates]
+
+    interval = config.get("liquidity_interval", 1)
+    if interval > 1:
+        am_w = am_w.iloc[::interval]
+        # ky_w = ky_w.iloc[::interval]
+        dv_w = dv_w.iloc[::interval]
+
+    # start with coins present in all three proxies
+    universe = (
+        am_w.columns
+        # .intersection(ky_w.columns)
+        .intersection(dv_w.columns)
+    )
+
+    # iterative filtering across thresholds
+    thresholds = config["liquidity_thresholds"]
+
+    for thr in thresholds:
+        # rank on each proxy
+        r_am = am_w[universe].rank(axis=1, method="min", ascending=True)
+        # r_ky = ky_w[universe].rank(axis=1, method="min", ascending=True)
+        r_dv = dv_w[universe].rank(axis=1, method="min", ascending=False)
+
+        ok_am = (r_am <= thr) & r_am.notna()
+        # ok_ky = (r_ky <= thr) & r_ky.notna()
+        ok_dv = (r_dv <= thr) & r_dv.notna()
+
+        # coins passing all dates for each proxy
+        pass_am = set(ok_am.all(axis=0).loc[lambda s: s].index)
+        # pass_ky = set(ok_ky.all(axis=0).loc[lambda s: s].index)
+        pass_dv = set(ok_dv.all(axis=0).loc[lambda s: s].index)
+
+        # intersect across proxies (and previous universe)
+        # new_univ = pass_am & pass_ky & pass_dv
+        new_univ = pass_am & pass_dv
+        universe = pd.Index(sorted(new_univ))
+        # print(len(universe), "coins left after threshold", thr)
+        # print(universe)
+
+        if universe.empty:
+            break
+
+    prices_filt  = prices .reindex(columns=universe).dropna(axis=1, how="all")
+    returns_filt = returns.reindex(columns=universe).dropna(axis=1, how="all")
+
+    return prices_filt, returns_filt, universe
+
         
 def form_pairs_crypto(prices: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
