@@ -15,6 +15,7 @@ import seaborn as sns
 import statsmodels.api as sm
 from IPython.display import display
 from scipy import stats
+import statsmodels.api as sm
 from statsmodels.graphics.tsaplots import plot_acf
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -91,7 +92,8 @@ def quote_volume(df: pd.DataFrame, agg_window: int) -> pd.DataFrame:
     out = []
     for coin, grp in df.groupby('coin'):
         grp = grp.set_index('close_time')
-        grp['quote_volume'] = grp['quote_volume'].rolling(f'{agg_window}min', min_periods=1).mean()
+        grp = grp.sort_index()
+        grp['quote_volume'] = grp['quote_volume'].rolling(window=agg_window, min_periods=1).sum()
         out.append(grp[['quote_volume']].reset_index().assign(coin=coin))
     return pd.concat(out, ignore_index=True)
 
@@ -134,7 +136,7 @@ def load_data_crypto(
     
     if verbose:
         print("\nPrices head:")
-        display(prices.head())
+        print(prices.head())
         plt.imshow(prices.isna(), aspect='auto', cmap='viridis', interpolation=None)
         plt.xlabel('Coin')
         plt.ylabel('Date')
@@ -145,7 +147,10 @@ def load_data_crypto(
     tickers = prices.columns
     assert amihud_pivot.columns.equals(tickers), "Amihud columns do not match prices columns"
     assert kyle_pivot.columns.equals(tickers), "Kyle columns do not match prices columns"
-    return prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot
+    funding_rates = pd.read_csv(config["FUNDING_RATES_PATH"])
+    funding_rates["close_time"] = pd.to_datetime(funding_rates["close_time"], utc=True)
+    funding_rates = funding_rates.set_index("close_time")
+    return prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot, funding_rates
 
 
 def plot_asset_with_max_return(returns, prices, max_rank=0):
@@ -213,7 +218,7 @@ def select_asset_universe_crypto(
     config: dict,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Index]:
     """
-    Reduces the cross-section to only those stocks which were members of the asset universe at the given time
+    Reduces the cross-section to only those coins which were members of the asset universe at the given time
     with sufficient non-missing data and valid returns over the lookback period. Also filters out coins with
     insufficient liquidity over the lookback period, as defined by the config.
 
@@ -221,25 +226,26 @@ def select_asset_universe_crypto(
         prices (pd.DataFrame): Minute-level close prices of the coins
         returns (pd.DataFrame): Minute-level returns of the coins
         amihud (pd.DataFrame): Amihud illiquidity measure
-        roll (pd.DataFrame): Roll serial cov estimator
         kyle (pd.DataFrame): Kyle illiquidity measure
         date (pd.Timestamp): The date at which to select the asset universe
         config (dict): Configuration parameters, containing the keys:
             - 'liquidity_interval': Interval in minutes for aggregating liquidity measures
             - 'liquidity_filter_length': Length of the lookback period for liquidity filtering
             - 'criterion': Liquidity measure to use ('amihud', 'kyle', or 'quote_volume')
-            - 'max_rank': Maximum rank of coins to keep based on the liquidity measure
+            - 'liquidity_threshold': threshold based on the liquidity measure
 
     Returns:
         Tuple[pd.DataFrame, pd.DataFrame, pd.Index]: Prices, returns, and valid coins
     """
     criterion = config["criterion"]
-    max_rank = config["max_rank"]
+    liquidity_threshold = config["liquidity_threshold"]
     interval = config["liquidity_interval"]
     
     # get the index of the date closest to the given date
     lookback_end_idx = prices.index.get_loc(date)
-    lookback_start_idx = lookback_end_idx - config['liquidity_filter_length']
+    lookback_start_idx = lookback_end_idx - config['FORMATION_PERIOD'] + 1
+    if lookback_start_idx < 0:
+        lookback_start_idx = 0
     liquidity_window = prices.index[lookback_start_idx:lookback_end_idx]
     
     # filter out coins with insufficient liquidity
@@ -248,7 +254,7 @@ def select_asset_universe_crypto(
         if interval > 1:
             amihud_window = amihud_window.iloc[::interval, :]
         ranks = amihud_window.rank(axis=1, method="min", ascending=True)
-        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        valid_coins = (ranks <= liquidity_threshold).all(axis=0) & ranks.notna().all(axis=0)
         ranks_filtered = ranks.loc[:, valid_coins]
         valid_coins = ranks_filtered.columns
     
@@ -257,21 +263,21 @@ def select_asset_universe_crypto(
         if interval > 1:
             kyle_window = kyle_window.iloc[::interval, :]
         ranks = kyle_window.rank(axis=1, method="min", ascending=True)
-        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
+        valid_coins = (ranks <= liquidity_threshold).all(axis=0) & ranks.notna().all(axis=0)
         ranks_filtered = ranks.loc[:, valid_coins]
         valid_coins = ranks_filtered.columns
         
     elif criterion == "quote_volume":
         dollar_volume_window = dollar_volume.loc[liquidity_window]
-        if interval > 1:
-            # keep only every nth row based on granularity
-            dollar_volume_window = dollar_volume_window.iloc[::interval, :]
-        ranks = dollar_volume_window.rank(axis=1, method="max", ascending=False)
-        valid_coins = (ranks <= max_rank).all(axis=0) & ranks.notna().all(axis=0)
-        ranks_filtered = ranks.loc[:, valid_coins]
-        valid_coins = ranks_filtered.columns
+        valid_coins = (dollar_volume_window >= liquidity_threshold).all(axis=0) & dollar_volume_window.notna().all(axis=0)
+        dollar_volume_window = dollar_volume_window.loc[:, valid_coins]
+        valid_coins = dollar_volume_window.columns
     else:
         raise ValueError(f"Unknown liquidity measure: {criterion}. Valid options are 'amihud', 'kyle', or 'quote_volume'.")
+    # Also remove coins with missing prices over the lookback period
+    prices_window = prices.loc[liquidity_window, valid_coins]
+    prices_window = prices_window.dropna(how='all', axis=1)  # drop coins with all NaN prices
+    valid_coins = prices_window.columns
     return prices[valid_coins], returns[valid_coins], valid_coins
         
         
@@ -349,9 +355,9 @@ def estimate_hedge_ratio(prices: pd.DataFrame, pairs: pd.DataFrame, config: dict
         # compute hedge ratio between the two stocks
         if config['HEDGE_RATIO_METHOD'] == 'ols': 
             # regress stock 2 on stock 1
-            res = stats.linregress(prices_1, prices_2)
+            res = sm.OLS(prices_2, prices_1).fit()
             # hedge ratio = slope of ols regression
-            hedge_ratio_signed = res.slope
+            hedge_ratio_signed = res.params.iloc[0]  # slope coefficient
         elif config['HEDGE_RATIO_METHOD'] == 'unit': 
             hedge_ratio_signed = 1.0
         elif config['HEDGE_RATIO_METHOD'] == 'mvhr': 
@@ -365,6 +371,7 @@ def estimate_hedge_ratio(prices: pd.DataFrame, pairs: pd.DataFrame, config: dict
         # compute spread
         spread = prices_2 - hedge_ratio_signed * prices_1
         # perform ADF test on the spread
+        spread = spread.dropna()  # drop NaN values to avoid issues with ADF
         adf = arch.unitroot.ADF(spread)
         # extract ADF statistic, p-value
         adf_stat, adf_pvalue = adf.stat, adf.pvalue
@@ -402,55 +409,61 @@ def compute_signal(prices: pd.DataFrame, hedge_ratios: pd.DataFrame, config: dic
     dict
         Dictionary with signals for each pair
     """
+    # Your code here
+    signal_threshold = config['Z_THRESHOLD']
     signals = {}
 
-    for index, row in hedge_ratios.iterrows():
-        price_series_1 = prices[row["stock1"]]
-        price_series_2 = prices[row["stock2"]]
-        hedge_ratio = row["hedge_ratio"]
-        spread = price_series_2 - hedge_ratio * price_series_1
-        spread_rolling_mean = spread.rolling(window=config['ESTIMATION_PERIOD']).mean()
-        spread_rolling_std = spread.rolling(window=config['ESTIMATION_PERIOD']).std()
-        z_score = (spread - spread_rolling_mean) / spread_rolling_std
-        signal_df = pd.DataFrame(index=prices.index)
-        signal_df["signal"] = 0
-        s1_prices_norm = price_series_1 / price_series_1.iloc[0]
-        s2_prices_norm = price_series_2 / price_series_2.iloc[0]
-        current_state = 0 # 0 for no position, 1 for long (short stock 1 long stock 2), -1 for short (long stock 1 short stock 2)
-        for index_inner, row_alt in signal_df.iterrows():
-            match current_state:
-                case 0: # We previously had no position
-                    if z_score[index_inner] > config['Z_THRESHOLD']:
-                        signal_df.at[index_inner, 'signal'] = -1
-                        current_state = -1
-                    elif z_score[index_inner] < -config['Z_THRESHOLD']:
-                        signal_df.at[index_inner, 'signal'] = 1
-                        current_state = 1
-                    else:
-                        signal_df.at[index_inner, 'signal'] = 0
-                case 1: # We previously had a long position
-                    # close long position when normalized prices cross again
-                    if s2_prices_norm[index_inner] >= s1_prices_norm[index_inner]:
-                        signal_df.at[index_inner, 'signal'] = 0
-                        current_state = 0
-                    else:
-                        signal_df.at[index_inner, 'signal'] = 1
-                case -1:
-                    # close short position when normalized prices cross again
-                    if s2_prices_norm[index_inner] <= s1_prices_norm[index_inner]:
-                        signal_df.at[index_inner, 'signal'] = 0
-                        current_state = 0
-                    else:
-                        signal_df.at[index_inner, 'signal'] = -1
-                case _:
-                    raise ValueError(f"Unknown state: {current_state}")
-        signals[f"{row['stock1']}_{row['stock2']}"] = {
-            "stock1": row["stock1"],
-            "stock2": row["stock2"],
-            "hedge_ratio": hedge_ratio,
-            "signal": signal_df["signal"],
-            "z_score": z_score,
-        }
+    # loop through each pair in hedge_ratios
+    for _, row in hedge_ratios.iterrows():
+        stock_1, stock_2 = row['stock1'], row['stock2']
+        # extract price series of both stocks
+        stock_1_prices, stock_2_prices = prices[stock_1], prices[stock_2]
+        hedge_ratio = row['hedge_ratio']
+        # calculate spread between the two stocks
+        spread = stock_2_prices - hedge_ratio * stock_1_prices
+        # standardize spread with rolling window calculation
+        window_size = config['ESTIMATION_PERIOD']
+        rolling_mean = spread.rolling(window=window_size).mean()
+        rolling_std = spread.rolling(window=window_size).std()
+        z_score = (spread - rolling_mean) / rolling_std
+        # initialize empty signal for the pair of stocks
+        signal = pd.Series(data=0, index=prices.index) # initialize to all 0 (no pos)
+
+        # loop through time for the pair and generate trade signal
+        in_trade = False
+        # calculate normalized prices
+        s1_prices_norm = stock_1_prices / stock_1_prices.iloc[0]
+        s2_prices_norm = stock_2_prices / stock_2_prices.iloc[0]
+
+        for date in signal.index:
+            # if not in trade, check entry conditions
+            if not in_trade:
+                if z_score[date] < -signal_threshold:
+                    signal[date] = 1 # enter long spreaad pos
+                    entry_dir = 'long' # record whether long/short later for exit conditions
+                    in_trade = True
+                elif z_score[date] > signal_threshold:
+                    signal[date] = -1 # enter short spread pos
+                    entry_dir = 'short'
+                    in_trade = True
+
+            # if in trade, check exit conditions
+            else: 
+                # check convergence
+                if entry_dir == 'long' and s2_prices_norm[date] >= s1_prices_norm[date]: 
+                    signal[date] = 0 # close pos
+                    in_trade = False
+                elif entry_dir == 'short' and s2_prices_norm[date] <= s1_prices_norm[date]: 
+                    signal[date] = 0 # close pos   
+                    in_trade = False
+                # still in trade but don't need to exit -> mark date as corect signal
+                else: 
+                    signal[date] = 1 if entry_dir == 'long' else -1
+        
+        # add pair information to signals dictionary
+        pair_data = {'stock1': stock_1, 'stock2': stock_2, 'hedge_ratio': hedge_ratio, 
+                     'signal': signal, 'z_score': z_score}
+        signals[stock_1 + '_' + stock_2] = pair_data
     return signals
 
 
@@ -482,6 +495,7 @@ def allocate_positions(
     dict
         Dictionary with position information for each stock
     """
+    # Your code here
     positions = {} # will store positions for each stock: stock_name -> num shares
 
     # handle edge cases
@@ -551,6 +565,7 @@ def update_portfolio(
     prices: pd.DataFrame,
     date: pd.Timestamp,
     config: dict,
+    funding_rates: pd.DataFrame,
 ) -> dict:
     """
     Updates the portfolio based on target positions, accounting for transaction costs.
@@ -567,6 +582,8 @@ def update_portfolio(
         Current date
     config: dict
         Configuration parameters
+    funding_rates: pd.DataFrame
+        Dataframe of funding rates for each stock, with dates as index and tickers as columns    
         
     Returns:
     --------
@@ -595,6 +612,21 @@ def update_portfolio(
     total_transaction_cost_pct = 0
     total_transaction_cost_amount = 0
     total_turnover = 0
+    
+    # Add funding rate costs (before new positions, due to the way we merge, assuming constant leverage)
+    current_portfolio_funded = current_portfolio.copy()
+    for stock, position in current_portfolio.items():
+        funding_rate = funding_rates.at[date, stock] if date in funding_rates.index and stock in funding_rates.columns else 0
+        
+        if funding_rate == 0 or position == 0:
+            current_portfolio_funded[stock] = position
+            continue
+        else:
+            current_portfolio_funded[stock] =  position * (1 - funding_rate)
+        if stock not in target_positions:
+            # If the stock is not in target positions, we assume we want to keep the current position
+            target_positions[stock] = 0
+    current_portfolio = current_portfolio_funded
     
     # Update positions for each stock
     for stock, target_position in target_positions.items():
@@ -722,6 +754,7 @@ def update_portfolio(
 
 def implement_strategy(
     prices: pd.DataFrame,
+    funding_rate: pd.DataFrame,
     returns: pd.DataFrame,
     amihud: pd.DataFrame,
     kyle: pd.DataFrame,
@@ -765,8 +798,14 @@ def implement_strategy(
         print("Formation period: %s to %s" % (formation_start, formation_end))
         print("Trading period: %s to %s" % (trading_start, trading_end))
         
+        formation_prices = prices.loc[formation_start:formation_end]
+        formation_returns = returns.loc[formation_start:formation_end]
+        formation_amihud = amihud.loc[formation_start:formation_end]
+        formation_kyle = kyle.loc[formation_start:formation_end]
+        formation_dollar_volume = dollar_volume.loc[formation_start: formation_end]
+        
         # Select stocks for the formation period
-        formation_stocks, _, _ = select_asset_universe_crypto(prices, returns, amihud, kyle, dollar_volume, formation_end, config)
+        formation_stocks, _, _ = select_asset_universe_crypto(formation_prices, formation_returns, formation_amihud, formation_kyle, formation_dollar_volume, formation_end, config)
         
         if formation_stocks.empty or formation_stocks.shape[1] < 2:
             print("Not enough stocks with complete data in the formation period. Skipping.")
@@ -847,7 +886,8 @@ def implement_strategy(
                 positions,
                 trading_data,
                 date,
-                config
+                config,
+                funding_rate,
             )
             
             # Extract values from the portfolio update
@@ -956,12 +996,12 @@ def analyze_performance(
     # Calculate basic metrics
     net_returns = metrics_df['net_returns']
     metrics['Net Total Return'] = (1 + net_returns).prod() - 1
-    metrics['Net Annualized Return'] = (1 + metrics['Net Total Return']) ** (252 / len(net_returns)) - 1
-    metrics['Net Volatility'] = net_returns.std() * np.sqrt(252)
+    metrics['Net Annualized Return'] = float((1 + metrics['Net Total Return']) ** (525_600 / len(net_returns))) - 1
+    metrics['Net Volatility'] = net_returns.std() * np.sqrt(525_600)
     metrics['Net Sharpe Ratio'] = metrics['Net Annualized Return'] / metrics['Net Volatility'] if metrics['Net Volatility'] > 0 else 0
     metrics['Gross Total Return'] = (1 + metrics_df['gross_returns']).prod() - 1
-    metrics['Gross Annualized Return'] = (1 + metrics['Gross Total Return']) ** (252 / len(metrics_df['gross_returns'])) - 1
-    metrics['Gross Volatility'] = metrics_df['gross_returns'].std() * np.sqrt(252)
+    metrics['Gross Annualized Return'] = (1 + metrics['Gross Total Return']) ** (525_600 / len(metrics_df['gross_returns'])) - 1
+    metrics['Gross Volatility'] = metrics_df['gross_returns'].std() * np.sqrt(525_600)
     metrics['Gross Sharpe Ratio'] = metrics['Gross Annualized Return'] / metrics['Gross Volatility'] if metrics['Gross Volatility'] > 0 else 0
     
     # Calculate drawdown
@@ -1567,6 +1607,7 @@ def validate_config(config: dict) -> None:
     """
     assert config['CRYPTO_CSV_PATH'], "Crypto CSV path must be specified"
     assert config['SAMPLE_PRICES_PATH'], "Sample prices path must be specified"
+    assert config['FUNDING_RATES_PATH'], "Funding rates path must be specified"
     assert config['FORMATION_PERIOD'] > 0, "Formation period must be positive"
     assert config['TRADING_PERIOD'] > 0, "Trading period must be positive"
     assert config['n_pairs'] > 0, "Number of pairs must be positive"
@@ -1575,6 +1616,7 @@ def validate_config(config: dict) -> None:
     assert 0 < config['COINT_THRESHOLD'] < 1, "Cointegration threshold must be in (0, 1)"
     assert config['ESTIMATION_PERIOD'] > 0, "Estimation period must be positive"
     assert config['ESTIMATION_PERIOD'] < config['TRADING_PERIOD'], "Estimation period must fit inside trading period"
+    assert config['ESTIMATION_PERIOD'] < config['FORMATION_PERIOD'], "Estimation period must fit inside formation period"
     assert config['Z_THRESHOLD'] > 0, "Z-score threshold must be positive"
     assert config['TRANSACTION_COST'] >= 0, "Transaction cost must be non-negative"
     assert config['BORROW_RATE_DAILY'] >= 0, "Borrowing rate must be non-negative"
@@ -1600,13 +1642,14 @@ def run_backtest(config):
     unique_id = get_unique_id(config)
     
     # Load the data
-    prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot = load_data_crypto(config)
+    prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot, funding_rate = load_data_crypto(config)
     
     # Load results if extant, otherwise run strategy
     results = load_results(unique_id)
     if not results:
         results = implement_strategy(
             prices,
+            funding_rate,
             returns,
             amihud_pivot,
             kyle_pivot,
