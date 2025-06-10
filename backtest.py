@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import pickle
-import warnings
 import itertools
 import arch.unitroot
 import matplotlib.pyplot as plt
@@ -10,15 +9,15 @@ import matplotlib.ticker as mpl_ticker
 import numpy as np
 import pandas as pd
 import petname
-import quantstats_lumi as qs
 import seaborn as sns
 import statsmodels.api as sm
 from IPython.display import display
-from scipy import stats
+
 import statsmodels.api as sm
 from statsmodels.graphics.tsaplots import plot_acf
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from statsmodels.tsa.arima.model import ARIMA
+from scipy.optimize import minimize
+from typing import Tuple
 
 from dist_metrics.temporal_distances import (
     lcs_distance,
@@ -151,61 +150,6 @@ def load_data_crypto(
     funding_rates["close_time"] = pd.to_datetime(funding_rates["close_time"], utc=True)
     funding_rates = funding_rates.set_index("close_time")
     return prices, returns, tickers, amihud_pivot, kyle_pivot, quote_volume_pivot, funding_rates
-
-
-def plot_asset_with_max_return(returns, prices, max_rank=0):
-    """
-    Plots the asset with the highest return in the returns dataframe.
-    
-    Parameters:
-    -----------
-    returns: pd.DataFrame
-        Dataframe of returns with tickers as columns and dates as index
-    prices: pd.DataFrame
-        Dataframe of prices with tickers as columns and dates as index
-    max_rank: int
-        Rank of the asset to plot
-        
-    Returns:
-    --------
-    None. Plots the asset with the highest return in the returns dataframe
-    """
-    # find asset index with the specified rank of return
-    max_returns = pd.DataFrame({'max_return': returns.max(axis=1), 'idx': returns.idxmax(axis=1)}, columns=['max_return', 'idx'])
-    asset_idx = max_returns.sort_values(by='max_return', ascending=False).iloc[max_rank]['idx']
-    max_return_date = max_returns.sort_values(by='max_return', ascending=False).index[max_rank]
-
-    # plot this asset
-    prices[asset_idx].plot()
-    # plot the date of the max return
-    plt.axvline(max_return_date, color='r', linestyle='--')
-    # plot text of the price of the asset at the max return date
-    # Add a text box with information on the side of the chart
-    info_text = (
-        f'Rank: {max_rank}\n'
-        f'Ticker: {asset_idx}\n'
-        f'Date: {max_return_date.strftime("%Y-%m-%d")}\n'
-        f'Price t:    {prices[asset_idx][max_return_date]:.2f}\n'
-    )
-    
-    try:
-        # Find the index position of max_return_date in the prices dataframe
-        date_idx = prices.index.get_loc(max_return_date)
-        if date_idx > 0:  # Make sure there is a previous trading day
-            prev_date = prices.index[date_idx - 1]
-            info_text += f'Price t-1: {prices[asset_idx][prev_date]:.2f}\n'
-        else:
-            info_text += 'Price t-1: N/A\n'
-    except:
-        info_text += 'Price t-1: N/A\n'
-        
-    info_text += f'Return: {returns[asset_idx][max_return_date]:.1%}'
-    
-    # Position the text box outside the main plot area
-    plt.figtext(0.85, 0.5, info_text, bbox=dict(facecolor='white', alpha=0.8), 
-                verticalalignment='center', color='r')
-    plt.axhline(0, color='r', linestyle='--')
-    plt.show()
 
 
 def select_asset_universe_crypto(
@@ -465,6 +409,345 @@ def compute_signal(prices: pd.DataFrame, hedge_ratios: pd.DataFrame, config: dic
                      'signal': signal, 'z_score': z_score}
         signals[stock_1 + '_' + stock_2] = pair_data
     return signals
+
+
+def arma_one_step_forecast(spreads_list):
+    """
+    Fit ARMA(1,1) to each spread and compute one-step ahead forecasts.
+    
+    Parameters:
+    -----------
+    spreads_list : list of pd.Series
+        List of spread time series (each a pandas Series of floats)
+    
+    Returns:
+    --------
+    tuple : (forecast_vector, cov_matrix)
+        - forecast_vector: np.array of one-step ahead forecasts
+        - cov_matrix: Diagonal covariance matrix of forecast errors
+    """
+    import warnings
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+    import arch.unitroot
+    
+    n_spreads = len(spreads_list)
+    forecasts = np.zeros(n_spreads)
+    variances = np.zeros(n_spreads)
+    
+    for i, spread in enumerate(spreads_list):
+        # Set frequency to minute to ensure correct time series handling
+        spread = spread.asfreq('min')
+        
+        # Suppress convergence warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=ConvergenceWarning)
+            
+            try:
+                # Fit ARMA(1,1) model
+                model = ARIMA(spread, order=(1, 0, 1))
+                fitted = model.fit()
+                
+                # Check if model converged
+                if fitted.mle_retvals['converged']:
+                    # Check if residuals are stationary (pass ADF test)
+                    residuals = fitted.resid.dropna()
+                    adf_result = arch.unitroot.ADF(residuals)
+                    
+                    if adf_result.pvalue <= 0.05:  # Residuals are stationary
+                        # Use ARMA forecast
+                        forecast_result = fitted.forecast(steps=1)
+                        forecasts[i] = forecast_result.iloc[0] if hasattr(forecast_result, 'iloc') else float(forecast_result)
+                        
+                        # Get forecast variance
+                        forecast_se = fitted.get_forecast(steps=1).summary_frame()['mean_se'].iloc[0]
+                        variances[i] = forecast_se ** 2
+                        
+                        # Check for unreasonably small variance
+                        if variances[i] <= 1e-12:
+                            variances[i] = spread.diff().dropna().var()
+                            if variances[i] <= 1e-12:
+                                variances[i] = 0.0001
+                    else:
+                        # Residuals fail ADF test - use fallback
+                        forecasts[i] = spread.iloc[-1]
+                        variances[i] = spread.diff().dropna().var()
+                        if variances[i] <= 1e-12:
+                            variances[i] = 0.0001
+                else:
+                    # Model failed to converge - use fallback
+                    forecasts[i] = spread.iloc[-1]
+                    variances[i] = spread.diff().dropna().var()
+                    if variances[i] <= 1e-12:
+                        variances[i] = 0.0001
+                        
+            except Exception as e:
+                # Any other error - use fallback
+                forecasts[i] = spread.iloc[-1]
+                variances[i] = spread.diff().dropna().var()
+                if variances[i] <= 1e-12:
+                    variances[i] = 0.0001
+    
+    # Create diagonal covariance matrix
+    cov_matrix = np.diag(variances)
+    
+    return forecasts, cov_matrix
+
+
+def allocate_positions_sharpe(mean_vector, cov_matrix, risk_free_rate: float = 0.0):
+    """
+    Maximise the Sharpe ratio subject to sum(|w|) = 1.
+
+    Parameters
+    ----------
+    mean_vector : array-like
+        Expected returns for each spread.
+    cov_matrix  : array-like (n × n)
+        Covariance matrix of spreads.
+    risk_free_rate : float, optional
+        Risk-free rate (default 0 for spread trading).
+
+    Returns
+    -------
+    dict
+        Keys: weights, sharpe, expected_return, volatility,
+              success, abs_weight_sum, message
+    """
+    # --- Sanitise inputs -----------------------------------------------------
+    mean_vector = np.asarray(mean_vector, dtype=float).ravel()
+    cov_matrix  = np.asarray(cov_matrix, dtype=float)
+
+    n_assets = len(mean_vector)
+
+    # 0-asset edge case -------------------------------------------------------
+    if n_assets == 0 or cov_matrix.size == 0:
+        return {
+            "weights": np.array([]),
+            "sharpe": np.nan,
+            "expected_return": np.nan,
+            "volatility": np.nan,
+            "success": False,
+            "message": "Empty mean_vector / cov_matrix — nothing to allocate.",
+        }
+
+    # Shape check -------------------------------------------------------------
+    if cov_matrix.shape != (n_assets, n_assets):
+        raise ValueError(
+            f"cov_matrix shape {cov_matrix.shape} does not match mean_vector "
+            f"length ({n_assets})."
+        )
+
+    # 1-asset fast path -------------------------------------------------------
+    if n_assets == 1:
+        w = np.array([1.0])  # |w| must equal 1, sign is irrelevant for Sharpe
+        port_ret = w @ mean_vector
+        port_var = w @ cov_matrix @ w
+        port_std = np.sqrt(port_var)
+        sharpe   = (port_ret - risk_free_rate) / port_std
+        return {
+            "weights": w,
+            "sharpe": sharpe,
+            "expected_return": port_ret,
+            "volatility": port_std,
+            "success": True,
+            "abs_weight_sum": 1.0,
+            "message": "Single-asset shortcut",
+        }
+
+    # --- Original optimiser --------------------------------------------------
+    def negative_sharpe(weights):
+        port_ret = weights @ mean_vector
+        port_var = weights @ cov_matrix @ weights
+        port_std = np.sqrt(port_var)
+        if port_std < 1e-8:
+            return 1e8  # penalise near-zero volatility
+        return -(port_ret - risk_free_rate) / port_std
+
+    def abs_sum_constraint(weights):
+        return np.sum(np.abs(weights)) - 1.0
+
+    constraints = {"type": "eq", "fun": abs_sum_constraint}
+    bounds      = [(-1.0, 1.0)] * n_assets
+
+    # Starter seeds -----------------------------------------------------------
+    rng = np.random.default_rng(0)  # reproducible randomness
+    initial_guesses = [
+        np.ones(n_assets) / n_assets,
+        mean_vector / (np.sum(np.abs(mean_vector)) or 1.0),
+        rng.standard_normal(n_assets),
+        np.sign(mean_vector) / n_assets,
+    ]
+
+    best = None
+    best_sharpe = -np.inf
+
+    for w0 in initial_guesses:
+        w0 /= np.sum(np.abs(w0)) or 1.0  # normalise to |w|₁ = 1
+        try:
+            res = minimize(
+                negative_sharpe,
+                w0,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"ftol": 1e-9, "maxiter": 1000},
+            )
+        except ValueError as e:
+            # SciPy can raise if bounds/constraints inconsistent — skip seed
+            continue
+
+        if res.success and -res.fun > best_sharpe:
+            best, best_sharpe = res, -res.fun
+
+    # Fallback or success -----------------------------------------------------
+    if best is None:
+        # mean-proportional fallback
+        w = mean_vector / (np.sum(np.abs(mean_vector)) or 1.0)
+        port_ret = w @ mean_vector
+        port_var = w @ cov_matrix @ w
+        port_std = np.sqrt(port_var)
+        sharpe   = (port_ret - risk_free_rate) / port_std
+        return {
+            "weights": w,
+            "sharpe": sharpe,
+            "expected_return": port_ret,
+            "volatility": port_std,
+            "success": False,
+            "abs_weight_sum": np.sum(np.abs(w)),
+            "message": "Optimiser failed — using proportional weights",
+        }
+
+    opt_w = best.x
+    port_ret = opt_w @ mean_vector
+    port_var = opt_w @ cov_matrix @ opt_w
+    port_std = np.sqrt(port_var)
+
+    return {
+        "weights": opt_w,
+        "sharpe": best_sharpe,
+        "expected_return": port_ret,
+        "volatility": port_std,
+        "success": best.success,
+        "abs_weight_sum": np.sum(np.abs(opt_w)),
+        "message": best.message,
+    }
+    
+    
+def allocate_positions_from_weights(
+    weights: dict,
+    config: dict,
+    prices: pd.DataFrame,
+    date: pd.Timestamp,
+    portfolio_cash: float,
+) -> dict:
+    """
+    Position sizing that allocates cash according to weight vector.
+    
+    Parameters:
+    -----------
+    weights: dict
+        Dictionary mapping pair strings to their weights (sum of |weights| = 1)
+        Format: {'{stock1}_{stock2}': {'weight': float, 'hedge_ratio': float, ...}}
+    config: dict
+        Configuration parameters, containing MAX_LEVERAGE
+    prices: pd.DataFrame
+        Dataframe of stock prices with dates as index and tickers as columns
+    date: pd.Timestamp
+        Current date for price reference
+    portfolio_cash: float
+        Available cash in the portfolio
+    
+    Returns:
+    --------
+    dict
+        Dictionary with position information for each stock
+    """
+    positions = {}  # will store positions for each stock: stock_name -> num shares
+
+    # handle edge cases
+    if date not in prices.index:
+        return positions
+    if portfolio_cash is None or portfolio_cash <= 0:
+        return positions
+    
+    # collect pairs with non-zero weights
+    active_pairs = []
+    for pair_str, pair_info in weights.items():
+        # Extract stocks from pair string (assuming format 'STOCK1_STOCK2')
+        stocks = pair_str.split('_')
+        if len(stocks) != 2:
+            continue
+        stock_1, stock_2 = stocks[0], stocks[1]
+        
+        # Get weight and hedge ratio
+        weight = pair_info.get('weight', 0)
+        hedge_ratio = pair_info.get('hedge_ratio', 1)
+        
+        # Skip zero weights
+        if weight == 0 or pd.isna(weight):
+            continue
+            
+        # Skip pairs where we don't have price data for both stocks
+        if stock_1 not in prices.columns or stock_2 not in prices.columns:
+            continue
+            
+        # Get current prices
+        price_1 = prices.at[date, stock_1]
+        price_2 = prices.at[date, stock_2]
+        
+        # Skip if prices are invalid
+        if pd.isna(price_1) or pd.isna(price_2) or price_1 <= 0 or price_2 <= 0:
+            continue
+        
+        # Store info for the active pair
+        active_pairs.append({
+            'stock1': stock_1, 
+            'stock2': stock_2, 
+            'hedge_ratio': hedge_ratio,
+            'weight': weight,  # Can be positive or negative
+            'price1': price_1, 
+            'price2': price_2
+        })
+
+    # If no active pairs found, return empty positions
+    if len(active_pairs) == 0:
+        return positions
+    
+    # Total leveraged capital
+    total_capital = portfolio_cash * config['MAX_LEVERAGE']
+    
+    for pair in active_pairs:
+        # Extract info for pair
+        stock1, stock2 = pair['stock1'], pair['stock2']
+        price1, price2 = pair['price1'], pair['price2']
+        hedge_ratio = pair['hedge_ratio']
+        weight = pair['weight']
+        
+        # Allocate capital based on weight magnitude
+        pair_capital = total_capital * abs(weight)
+        
+        # Calculate position sizes
+        # For a spread position, we need to balance the notional values
+        notional_ratio = (hedge_ratio * price2) / price1
+        shares1 = pair_capital / (price1 * (1 + notional_ratio))
+        shares2 = shares1 * hedge_ratio
+        
+        # Initialize positions if they don't exist
+        if stock1 not in positions: 
+            positions[stock1] = 0
+        if stock2 not in positions:
+            positions[stock2] = 0
+        
+        # Update positions based on weight sign
+        # Positive weight: long spread (short stock1, long stock2)
+        # Negative weight: short spread (long stock1, short stock2)
+        if weight > 0:  # Long spread
+            positions[stock1] -= shares1
+            positions[stock2] += shares2
+        else:  # Short spread (weight < 0)
+            positions[stock1] += shares1
+            positions[stock2] -= shares2
+    
+    return positions
 
 
 def allocate_positions(
@@ -822,7 +1105,6 @@ def implement_strategy(
             continue
         else: 
             print(f"Pairs found: {len(hedge_ratios)}")
-            
             for _, pair_row in hedge_ratios.iterrows():
                 pairs_history.append({
                     'formation_start': formation_start,
@@ -848,9 +1130,6 @@ def implement_strategy(
         print(f"Using data from {estimation_start} to {trading_end} for signal calculation")
         print(f"Actual trading period: {trading_start} to {trading_end}")
         
-        # Compute signals for the trading period (including estimation lookback)
-        signals = compute_signal(trading_data, hedge_ratios, config)
-        
         # Reset position timestamps for new trading period
         active_position_timestamps = {}
         
@@ -858,28 +1137,99 @@ def implement_strategy(
         # we still only start trading at the proper trading_start date
         trading_dates_only = trading_data.loc[trading_start:trading_end].index
         
-        # # Compute positions for the first trading day
-        positions = allocate_positions(
-            signals,
-            config,
-            trading_data,
-            trading_dates_only[0],
-            current_portfolio.get('cash')
-        )
-        
+        if config["strategy"] == "zscore":
+            # Compute signals for the trading period (including estimation lookback)
+            signals = compute_signal(trading_data, hedge_ratios, config)
+            
+            # # Compute positions for the first trading day
+            positions = allocate_positions(
+                signals,
+                config,
+                trading_data,
+                trading_dates_only[0],
+                current_portfolio.get('cash')
+            )
+            
+        elif config["strategy"] == "forecast":
+            spreads = []
+            for pair_key, pair_data in hedge_ratios.iterrows():
+                stock_1 = pair_data['stock1']
+                stock_2 = pair_data['stock2']
+                hedge_ratio = pair_data['hedge_ratio']
+                
+                # Get the spread series for the pair
+                spread_series = formation_stocks[stock_2] - hedge_ratio * formation_stocks[stock_1]
+                spreads.append(spread_series)
+                
+            mean, cov = arma_one_step_forecast(
+                spreads,
+            )
+            last_obs   = np.array([s.iloc[-1] for s in spreads])
+            mean   = mean - last_obs
+            res = allocate_positions_sharpe(mean, cov)
+            weights = {}
+            for i, (pair_key, pair_data) in enumerate(hedge_ratios.iterrows()):
+                stock_1 = pair_data['stock1']
+                stock_2 = pair_data['stock2']
+                weights[f"{stock_1}_{stock_2}"] = {
+                    'weight': res['weights'][i],
+                    'hedge_ratio': pair_data['hedge_ratio']
+                }
+            positions = allocate_positions_from_weights(
+                weights,
+                config,
+                formation_stocks,
+                trading_dates_only[0],
+                current_portfolio.get('cash')
+            )
+            
         # Update portfolio for each day in the trading period (not including estimation data)
-        for date in trading_dates_only:
+        for i, date in enumerate(trading_dates_only):
             # Recompute positions for each day to account for lagged signals and leverage constraints
             # Only do this after the first day, since we already did it for the first day
-            if date != trading_dates_only[0]:
-                positions = allocate_positions(
-                    signals,
-                    config,
-                    trading_data,
-                    date,
-                    current_portfolio.get('cash')
-                )
-            
+            if date != trading_dates_only[0] and (i-1) % config["update_frequency"] == 0:
+                if config["strategy"] == "zscore":
+                    positions = allocate_positions(
+                        signals,
+                        config,
+                        trading_data,
+                        date,
+                        current_portfolio.get('cash')
+                    )
+                elif config["strategy"] == "forecast":
+                    trading_data_subset = trading_data.loc[estimation_start:date]
+                    hedge_ratios_subset = estimate_hedge_ratio(trading_data_subset, pairs, config)
+                    spreads = []
+                    for pair_key, pair_data in hedge_ratios_subset.iterrows():
+                        stock_1 = pair_data['stock1']
+                        stock_2 = pair_data['stock2']
+                        hedge_ratio = pair_data['hedge_ratio']
+                        
+                        # Get the spread series for the pair
+                        spread_series = trading_data_subset[stock_2] - hedge_ratio * trading_data_subset[stock_1]
+                        spreads.append(spread_series)
+                        
+                    mean, cov = arma_one_step_forecast(
+                        spreads,
+                    )
+                    last_obs   = np.array([s.iloc[-1] for s in spreads])
+                    mean   = mean - last_obs
+                    res = allocate_positions_sharpe(mean, cov)
+                    weights = {}
+                    for i, (pair_key, pair_data) in enumerate(hedge_ratios_subset.iterrows()):
+                        stock_1 = pair_data['stock1']
+                        stock_2 = pair_data['stock2']
+                        weights[f"{stock_1}_{stock_2}"] = {
+                            'weight': res['weights'][i],
+                            'hedge_ratio': pair_data['hedge_ratio']
+                        }
+                    positions = allocate_positions_from_weights(
+                        weights,
+                        config,
+                        trading_data_subset,
+                        date,
+                        current_portfolio.get('cash')
+                    )
             # Update portfolio
             portfolio_update = update_portfolio(
                 current_portfolio,

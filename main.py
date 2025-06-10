@@ -1,4 +1,6 @@
 # %%
+%load_ext autoreload
+%autoreload 2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -21,9 +23,10 @@ config = {
     "CRYPTO_CSV_PATH": "prices.csv",
     "SAMPLE_PRICES_PATH": "/share/data/jfuest_crypto/sample/prices.csv",
     "FUNDING_RATES_PATH": "funding_rates.csv",
+    "strategy": "forecast", # options: 'forecast', 'zscore'
     "criterion": "quote_volume", # criterion, must be one of 'quote_volume', 'amihud', 'kyle'
     "liquidity_interval": 60*24*7, # Length of intervals for aggergatuion of the liquidity measure 
-    "liquidity_threshold": 500000000, # highest liquidity rank allowed for impact metric, min hourly volume if quote volume
+    "liquidity_threshold": 500000000, # highest liquidity rank allowed for impact metric, min interval volume if quote volume
     "dist_metric": "ssd", # options: 'ssd', 'manhattan', 'euclidean', 'correlation', 'dtw', 'lcs'
     "n_pairs": 10, # Number of pairs to form
     'HEDGE_RATIO_METHOD': 'ols', # options (for now) are ols and unit
@@ -43,7 +46,7 @@ config = {
     'FORMATION_PERIOD': 60*24*7, # Used to filter by liquidity, and form pairs
     'TRADING_PERIOD': 60*24*7, # Muste be greaterthat formation period
     'SAVE_RESULTS': True, # Whether to save the results to a CSV file
-    
+    'update_frequency': 60*24, # How often to update the portfolio (in minutes)
 }
 
 # %% run select asset universe
