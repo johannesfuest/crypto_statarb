@@ -78,5 +78,5 @@ if __name__== "__main__":
     prices = remove_unnecessary_cols(prices)
     prices = pivot_df(prices)
     funding_rates = pivot_funding_rate(prices, funding_rates)
-    prices.to_csv("prices_6m.csv")
-    funding_rates.to_csv("funding_rates_6m.csv")
+    prices.to_csv("prices.csv")
+    funding_rates.to_csv("funding_rates.csv")

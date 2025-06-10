@@ -144,7 +144,9 @@ def main(start_ym: str, end_ym: str, coins: list[str], dest: Path) -> None:
     fund_df  = pd.concat(fund_frames,  ignore_index=True) if fund_frames  else pd.DataFrame()
 
     # -------- persist and clean -------------------------------------------- #
+    print("Saving prices frames...")
     price_df.to_csv(dest / "prices.csv", index=False)
+    print("Saving funding rates frames...")
     fund_df.to_csv(dest / "funding_rates.csv", index=False)
 
     shutil.rmtree(raw_dir)
